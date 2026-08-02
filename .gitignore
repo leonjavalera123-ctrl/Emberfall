@@ -23,6 +23,15 @@ dist/*
 /godot/*.png
 /godot/*.png.import
 
+# ─── Addon binaries for platforms we don't target ───────────────────────
+# Debug Draw 3D ships native libs for 6 platforms (41 MB total); Windows is
+# 4.2 MB of that. Linux is kept for a future Steam Deck build. The files stay
+# on disk and keep working — they just don't need to be in the repo.
+godot/addons/debug_draw_3d/libs/*android*
+godot/addons/debug_draw_3d/libs/*web*
+godot/addons/debug_draw_3d/libs/*macos*
+godot/addons/debug_draw_3d/libs/*ios*
+
 # ─── Blender ────────────────────────────────────────────────────────────
 # .blend sources ARE committed; only the rolling auto-backups are ignored.
 *.blend1
@@ -31,6 +40,11 @@ dist/*
 # ─── Python (retired pygame prototype in root) ──────────────────────────
 __pycache__/
 *.py[cod]
+
+# ─── Claude Code local state ────────────────────────────────────────────
+# Hash of the last green selftest. Machine-local, changes constantly.
+# .claude/settings.json and .claude/hooks/ ARE committed — they're project config.
+.claude/.selftest_state
 
 # ─── Scratch / OS / editor ──────────────────────────────────────────────
 out.txt
