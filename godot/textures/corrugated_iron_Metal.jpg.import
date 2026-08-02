@@ -3,19 +3,20 @@
 importer="texture"
 type="CompressedTexture2D"
 uid="uid://dc71txv0fjq73"
-path="res://.godot/imported/corrugated_iron_Metal.jpg-636a2d693b3b14e2ec97edf7e99dfc56.ctex"
+path.s3tc="res://.godot/imported/corrugated_iron_Metal.jpg-636a2d693b3b14e2ec97edf7e99dfc56.s3tc.ctex"
 metadata={
-"vram_texture": false
+"imported_formats": ["s3tc_bptc"],
+"vram_texture": true
 }
 
 [deps]
 
 source_file="res://textures/corrugated_iron_Metal.jpg"
-dest_files=["res://.godot/imported/corrugated_iron_Metal.jpg-636a2d693b3b14e2ec97edf7e99dfc56.ctex"]
+dest_files=["res://.godot/imported/corrugated_iron_Metal.jpg-636a2d693b3b14e2ec97edf7e99dfc56.s3tc.ctex"]
 
 [params]
 
-compress/mode=0
+compress/mode=2
 compress/high_quality=false
 compress/lossy_quality=0.7
 compress/uastc_level=0

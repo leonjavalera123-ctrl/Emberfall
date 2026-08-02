@@ -3,19 +3,20 @@
 importer="texture"
 type="CompressedTexture2D"
 uid="uid://bbnu8thscmwh0"
-path="res://.godot/imported/rusty_metal_02_nor_gl.jpg-ec611ff682e324cb3b4baa26da38b63f.ctex"
+path.s3tc="res://.godot/imported/rusty_metal_02_nor_gl.jpg-ec611ff682e324cb3b4baa26da38b63f.s3tc.ctex"
 metadata={
-"vram_texture": false
+"imported_formats": ["s3tc_bptc"],
+"vram_texture": true
 }
 
 [deps]
 
 source_file="res://textures/rusty_metal_02_nor_gl.jpg"
-dest_files=["res://.godot/imported/rusty_metal_02_nor_gl.jpg-ec611ff682e324cb3b4baa26da38b63f.ctex"]
+dest_files=["res://.godot/imported/rusty_metal_02_nor_gl.jpg-ec611ff682e324cb3b4baa26da38b63f.s3tc.ctex"]
 
 [params]
 
-compress/mode=0
+compress/mode=2
 compress/high_quality=false
 compress/lossy_quality=0.7
 compress/uastc_level=0

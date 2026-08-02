@@ -3,19 +3,20 @@
 importer="texture"
 type="CompressedTexture2D"
 uid="uid://bicctivesn5uy"
-path="res://.godot/imported/factory_wall_nor_gl.jpg-d240924cabfc306b680a1b5134dc7952.ctex"
+path.s3tc="res://.godot/imported/factory_wall_nor_gl.jpg-d240924cabfc306b680a1b5134dc7952.s3tc.ctex"
 metadata={
-"vram_texture": false
+"imported_formats": ["s3tc_bptc"],
+"vram_texture": true
 }
 
 [deps]
 
 source_file="res://textures/factory_wall_nor_gl.jpg"
-dest_files=["res://.godot/imported/factory_wall_nor_gl.jpg-d240924cabfc306b680a1b5134dc7952.ctex"]
+dest_files=["res://.godot/imported/factory_wall_nor_gl.jpg-d240924cabfc306b680a1b5134dc7952.s3tc.ctex"]
 
 [params]
 
-compress/mode=0
+compress/mode=2
 compress/high_quality=false
 compress/lossy_quality=0.7
 compress/uastc_level=0

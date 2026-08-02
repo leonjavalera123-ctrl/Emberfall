@@ -3,19 +3,20 @@
 importer="texture"
 type="CompressedTexture2D"
 uid="uid://cr1ba2xjqn532"
-path="res://.godot/imported/rust_coarse_01_Diffuse.jpg-c01198e9d4aca8f4d0d3911028a80747.ctex"
+path.s3tc="res://.godot/imported/rust_coarse_01_Diffuse.jpg-c01198e9d4aca8f4d0d3911028a80747.s3tc.ctex"
 metadata={
-"vram_texture": false
+"imported_formats": ["s3tc_bptc"],
+"vram_texture": true
 }
 
 [deps]
 
 source_file="res://textures/rust_coarse_01_Diffuse.jpg"
-dest_files=["res://.godot/imported/rust_coarse_01_Diffuse.jpg-c01198e9d4aca8f4d0d3911028a80747.ctex"]
+dest_files=["res://.godot/imported/rust_coarse_01_Diffuse.jpg-c01198e9d4aca8f4d0d3911028a80747.s3tc.ctex"]
 
 [params]
 
-compress/mode=0
+compress/mode=2
 compress/high_quality=false
 compress/lossy_quality=0.7
 compress/uastc_level=0

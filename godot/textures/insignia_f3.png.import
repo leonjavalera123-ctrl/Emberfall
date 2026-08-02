@@ -3,19 +3,20 @@
 importer="texture"
 type="CompressedTexture2D"
 uid="uid://db25gfvweu1jg"
-path="res://.godot/imported/insignia_f3.png-d8d2499d2c6b68fbfdbde27ac1749fce.ctex"
+path.s3tc="res://.godot/imported/insignia_f3.png-d8d2499d2c6b68fbfdbde27ac1749fce.s3tc.ctex"
 metadata={
-"vram_texture": false
+"imported_formats": ["s3tc_bptc"],
+"vram_texture": true
 }
 
 [deps]
 
 source_file="res://textures/insignia_f3.png"
-dest_files=["res://.godot/imported/insignia_f3.png-d8d2499d2c6b68fbfdbde27ac1749fce.ctex"]
+dest_files=["res://.godot/imported/insignia_f3.png-d8d2499d2c6b68fbfdbde27ac1749fce.s3tc.ctex"]
 
 [params]
 
-compress/mode=0
+compress/mode=2
 compress/high_quality=false
 compress/lossy_quality=0.7
 compress/uastc_level=0

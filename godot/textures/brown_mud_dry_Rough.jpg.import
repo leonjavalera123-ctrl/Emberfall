@@ -3,19 +3,20 @@
 importer="texture"
 type="CompressedTexture2D"
 uid="uid://cg1sp5y5rdtbv"
-path="res://.godot/imported/brown_mud_dry_Rough.jpg-ec5cc71111234e2a5f6123ae8509f77b.ctex"
+path.s3tc="res://.godot/imported/brown_mud_dry_Rough.jpg-ec5cc71111234e2a5f6123ae8509f77b.s3tc.ctex"
 metadata={
-"vram_texture": false
+"imported_formats": ["s3tc_bptc"],
+"vram_texture": true
 }
 
 [deps]
 
 source_file="res://textures/brown_mud_dry_Rough.jpg"
-dest_files=["res://.godot/imported/brown_mud_dry_Rough.jpg-ec5cc71111234e2a5f6123ae8509f77b.ctex"]
+dest_files=["res://.godot/imported/brown_mud_dry_Rough.jpg-ec5cc71111234e2a5f6123ae8509f77b.s3tc.ctex"]
 
 [params]
 
-compress/mode=0
+compress/mode=2
 compress/high_quality=false
 compress/lossy_quality=0.7
 compress/uastc_level=0
