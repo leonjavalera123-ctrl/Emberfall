@@ -1,0 +1,20 @@
+# Explicitly binary. Git usually auto-detects, but a stray text conversion on
+# a .glb, .wav or .png corrupts it silently — this makes that impossible.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.bmp  binary
+*.ico  binary
+*.hdr  binary
+*.exr  binary
+*.wav  binary
+*.ogg  binary
+*.mp3  binary
+*.glb  binary
+*.gltf binary
+*.blend binary
+*.ttf  binary
+*.otf  binary
+*.zip  binary
+*.exe  binary
+*.pck  binary

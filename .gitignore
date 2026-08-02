@@ -1,0 +1,43 @@
+# ─── Godot 4 ────────────────────────────────────────────────────────────
+# Editor cache and reimported assets. Regenerates on open (40 MB here).
+.godot/
+android/
+
+# NOTE: *.import and *.uid ARE committed on purpose.
+#   *.import carries load-bearing settings — the music WAVs need
+#     compress/mode=0 + edit/loop_mode=2 or the loops click and never repeat.
+#   *.uid are Godot 4.4+ stable resource IDs; losing them breaks references.
+
+# ─── Build output ───────────────────────────────────────────────────────
+# Emberfall.exe is 144 MB and the release zip is 74 MB. Git stores every
+# version of a binary in full and history cannot be trimmed without a rewrite,
+# so these must never enter the repo. The .ico and README are sources, kept.
+dist/*
+!dist/README.txt
+!dist/emberfall.ico
+
+# ─── Selftest screenshots ───────────────────────────────────────────────
+# --selftest / --skyshot / --lineup / --closeup write PNGs to godot/ root
+# and rewrite them every run. Leading slash anchors this to the repo root so
+# godot/textures/*.png is untouched.
+/godot/*.png
+/godot/*.png.import
+
+# ─── Blender ────────────────────────────────────────────────────────────
+# .blend sources ARE committed; only the rolling auto-backups are ignored.
+*.blend1
+*.blend2
+
+# ─── Python (retired pygame prototype in root) ──────────────────────────
+__pycache__/
+*.py[cod]
+
+# ─── Scratch / OS / editor ──────────────────────────────────────────────
+out.txt
+err.txt
+*.log
+*.tmp
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
