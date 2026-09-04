@@ -41,6 +41,8 @@ var orbit_anchor := Vector3.INF       # where an idle plane circles
 var _orbit_a := 0.0
 var _roll := 0.0
 var _prop: MeshInstance3D
+var _props: Array[MeshInstance3D] = []    # pipeline aircraft: every disc spins
+var _insig_mi: MeshInstance3D             # the roundel quads, for the lineup dump
 var _shadow: MeshInstance3D
 var garrison_target := -1             # heading to garrison this structure
 
@@ -177,6 +179,11 @@ var selected := false:
 var _ring: MeshInstance3D
 var _body: Node3D
 var _anim_t := 0.0
+var _prev_speed := 0.0       # suspension lean: frame-to-frame deltas
+var _prev_yaw := 0.0
+var recoil_v := 0.0          # set by army on firing; decays as the hull settles
+var _track_phase := 0.0      # scrolling tread position, metres travelled
+var _merged: MeshInstance3D = null   # the baked hull (holds the track shader)
 
 
 func setup(k: String, stats: Dictionary, fac: int, col: Color) -> void:
@@ -324,13 +331,34 @@ func step(dt: float, world: EFWorld) -> void:
 			global_transform.basis = global_transform.basis.slerp(
 				look.basis, minf(turn_speed * dt, 1.0)).orthonormalized()
 
-	# walk/engine bob, scaled by how fast we're actually moving. A section bobs
-	# per MAN inside squad_tick, so bobbing the whole body too would make all
-	# six rise and fall in lockstep.
+	# Vehicles don't hop — they LEAN. The old vertical sine made every truck
+	# bounce like a toy with no wheels. Suspension lean instead: squat on
+	# acceleration, nose-dip on braking, roll into turns, all from the frame-
+	# to-frame speed and heading deltas. Infantry sections animate per man in
+	# squad_tick, so the whole-body term skips them entirely.
 	_anim_t += dt * (vel.length() * 2.0 + 1.0)
-	var stride := clampf(vel.length() / speed, 0.0, 1.0)
 	if role != "inf":
-		_body.position.y = 0.035 * sin(_anim_t * 6.0) * stride
+		var sp_now := vel.length()
+		var yaw_now := global_transform.basis.get_euler().y
+		var d_speed := (sp_now - _prev_speed) / maxf(dt, 0.001)
+		var d_yaw := wrapf(yaw_now - _prev_yaw, -PI, PI) / maxf(dt, 0.001)
+		_prev_speed = sp_now
+		_prev_yaw = yaw_now
+		var k := minf(8.0 * dt, 1.0)
+		# accel -> tail squat (pitch back), brake -> nose dip; firing rocks the
+		# hull back on its suspension the same way (recoil_v decays to rest)
+		recoil_v = maxf(0.0, recoil_v - 0.5 * dt)
+		_body.rotation.x = lerpf(_body.rotation.x,
+			-clampf(d_speed * 0.022, -0.085, 0.085) + recoil_v * 1.4, k)
+		_body.position.z = lerpf(_body.position.z, recoil_v * 0.8, minf(14.0 * dt, 1.0))
+		# turn -> lean out of the corner, scaled by how fast we're going
+		_body.rotation.z = lerpf(_body.rotation.z,
+			clampf(d_yaw * sp_now * 0.012, -0.10, 0.10), k)
+		_body.position.y = 0.0
+		# treads scroll with the ground actually covered — distance, not time
+		if _merged != null:
+			_track_phase += sp_now * dt
+			_merged.set_instance_shader_parameter("track_scroll", _track_phase)
 	if _cargo:
 		_cargo.visible = cargo > 120.0
 
@@ -625,6 +653,8 @@ func _build_harvester(col: Color) -> void:
 
 func _build_ring() -> void:
 	var ring := TorusMesh.new()
+	ring.rings = 12
+	ring.ring_segments = 8
 	# a section needs a ring wide enough to hold six men, but `radius` itself
 	# must not change — it drives separation, pathing clearance, formation
 	# pitch and click tolerance across the whole game
@@ -689,6 +719,8 @@ func _fly_step(dt: float) -> void:
 		_body.rotation.z = _roll
 	if _prop:
 		_prop.rotate_object_local(Vector3.UP, dt * 50.0)
+	for p in _props:
+		p.rotate_object_local(Vector3.UP, dt * 50.0)
 	if _shadow:
 		_shadow.global_position = Vector3(global_position.x, 0.06, global_position.z)
 		_shadow.global_rotation = Vector3.ZERO
@@ -1052,15 +1084,143 @@ const GLB_KINDS := {
 }
 
 
+var custom_model := false    # a per-kind Hunyuan model: skip procedural dress
+
+
+# A pipeline hull carries no "Prop" child, so the first Hunyuan aircraft flew
+# with a dead nose while the old procedural planes kept spinning. These rebuild
+# the discs from the baked hull's OWN bounds: each entry is a position given as
+# a fraction of that AABB — so it tracks the model instead of a fixed guess that
+# would drift the moment a mesh is re-carved — plus a radius in metres and
+# whether the disc lies flat (rotorcraft) or stands upright (tractor/pusher).
+# The two fractions that position the disc ACROSS the airframe are given here;
+# the third is solved against the mesh, because a disc placed by guesswork ends
+# up buried inside the engine pod it is supposed to sit in front of.
+#   "front" = tractor, disc stands upright ahead of the nose/nacelle
+#   "rear"  = pusher, upright behind the tail/pod
+#   "top"   = rotor, disc lies flat above the cabin
+const CUSTOM_PROPS := {
+	"sparrowhawk": [[Vector3(0.50, 0.52, 0.0), 0.46, "front"]],
+	"pelican": [[Vector3(0.24, 0.66, 0.0), 0.42, "front"],
+		[Vector3(0.76, 0.66, 0.0), 0.42, "front"]],
+	"kondor": [[Vector3(0.50, 0.45, 0.0), 0.50, "front"]],
+	"duster": [[Vector3(0.50, 0.45, 0.0), 0.50, "front"]],
+	"seraph": [[Vector3(0.50, 0.40, 0.0), 0.34, "rear"]],
+	"wasp": [[Vector3(0.50, 0.0, 0.40), 1.30, "top"]],
+	"leviathan": [[Vector3(0.16, 0.26, 0.0), 0.34, "rear"],
+		[Vector3(0.84, 0.26, 0.0), 0.34, "rear"]],
+}
+
+
+# Widen the search until real geometry turns up. A fixed box is a silent
+# failure mode: the Pelican's wing simply was not where the first guess looked,
+# and both its roundels vanished with no error to explain it.
+#
+# Returns the WINNING VERTEX, not just its picked coordinate. Returning the
+# coordinate alone was the subtler version of the same bug — once the box had
+# to widen, the caller kept its original target and pinned the quad beside the
+# wing at the wing's height, which is how the roundels ended up hovering over
+# open ground next to the aircraft.
+static func _probe(verts: PackedVector3Array, ua: float, ub: float,
+		axis_a: int, axis_b: int, pick: int, want_max: bool) -> Vector3:
+	for grow: float in [1.0, 2.0, 4.0]:
+		var span: float = 0.28 * grow
+		var best := -INF
+		var win := Vector3.INF
+		for v in verts:
+			if absf(v[axis_a] - ua) <= span and absf(v[axis_b] - ub) <= span:
+				var s: float = v[pick] * (1.0 if want_max else -1.0)
+				if s > best:
+					best = s
+					win = v
+		if best > -INF:
+			return win
+	return Vector3.INF
+
+
+func _custom_prop(hull: AABB, verts: PackedVector3Array) -> void:
+	var spec: Array = CUSTOM_PROPS.get(kind, [])
+	if spec.is_empty() or verts.is_empty():
+		return
+	var pm := StandardMaterial3D.new()
+	pm.albedo_color = Color(0.22, 0.21, 0.20, 0.62)
+	pm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	for entry in spec:
+		var frac: Vector3 = entry[0]
+		var mode := String(entry[2])
+		var px: float = hull.position.x + hull.size.x * frac.x
+		var pos := Vector3.ZERO
+		if mode == "top":
+			var tz: float = hull.position.z + hull.size.z * frac.z
+			var top := _probe(verts, px, tz, 0, 2, 1, true)
+			if top == Vector3.INF:
+				continue
+			pos = top + Vector3(0, 0.12, 0)
+		else:
+			var ty: float = hull.position.y + hull.size.y * frac.y
+			var fwd := mode == "front"
+			var edge := _probe(verts, px, ty, 0, 1, 2, not fwd)
+			if edge == Vector3.INF:
+				continue
+			pos = edge + Vector3(0, 0, -0.05 if fwd else 0.05)
+		var disc := CylinderMesh.new()
+		disc.top_radius = float(entry[1])
+		disc.bottom_radius = float(entry[1])
+		disc.height = 0.04
+		disc.radial_segments = 20
+		var mi := MeshInstance3D.new()
+		mi.mesh = disc
+		mi.material_override = pm
+		mi.position = pos
+		if mode != "top":
+			mi.rotation_degrees = Vector3(90, 0, 0)
+		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		_body.add_child(mi)
+		_props.append(mi)
+
+
 func _try_glb(col: Color) -> bool:
+	# A model named for the KIND beats the shared class chassis: this is the
+	# hook the Crownhold-pipeline upgrade drops assets into, one unit at a
+	# time, without touching the units that still share the old models.
 	var model: String = GLB_KINDS.get(kind, "")
-	if model == "":
-		return false
-	var path := "res://models/unit_%s.glb" % model
-	if not ResourceLoader.exists(path):
-		return false
+	var path := "res://models/unit_%s.glb" % kind
+	if ResourceLoader.exists(path):
+		model = kind
+		custom_model = true
+	else:
+		if model == "":
+			return false
+		path = "res://models/unit_%s.glb" % model
+		if not ResourceLoader.exists(path):
+			return false
 	var inst: Node3D = (load(path) as PackedScene).instantiate()
 	_body.add_child(inst)
+	# Merge the hull into ONE mesh grouped by material: these models are ~30-45
+	# separate MeshInstance3Ds, and each was its own draw call on every unit.
+	# The baked node is parented to the glb root so it inherits the same
+	# axis-conversion transform the originals had.
+	var baked := _bake_vehicle_mesh(model, faction, inst, custom_model)
+	if baked != null:
+		var merged := MeshInstance3D.new()
+		merged.mesh = baked
+		_merged = merged        # step() feeds the track shader through this
+		inst.add_child(merged)
+		for child in inst.find_children("*", "MeshInstance3D", true, false):
+			var mi := child as MeshInstance3D
+			if mi != merged and _bakeable(String(mi.name)):
+				mi.queue_free()          # its geometry now lives in the merge
+		if flying:
+			_prop = inst.find_child("Prop", true, false) as MeshInstance3D
+			var sh := Vector2(1.9, 2.3)
+			if custom_model:
+				# the fixed patch was sized for the old shared chassis — a
+				# Leviathan would otherwise cast a fighter's shadow
+				var hull := inst.transform * baked.get_aabb()
+				_custom_prop(hull, _hull_verts())
+				sh = Vector2(hull.size.x, hull.size.z) * 0.85
+			_make_shadow(sh)
+		return true
 	_apply_tint(inst, col)
 	if flying:
 		_prop = inst.find_child("Prop", true, false) as MeshInstance3D
@@ -1069,6 +1229,46 @@ func _try_glb(col: Color) -> bool:
 
 
 static var _tint_cache := {}          # "%d|%d" % [src material id, faction] -> Material
+static var _relief_cache := {}        # same key -> a material wearing scanned plate
+static var _squad_tint_cache := {}    # plain tints for the baked infantry mesh
+static var _squad_walk_cache := {}    # source material id -> gait ShaderMaterial
+
+
+# Buildings have worn scanned Poly Haven plate since the texture round; units
+# never did, so an army of flat-colour hulls sat in front of buildings covered
+# in rivets and corrugation. This borrows the same normal/roughness maps.
+#
+# OBJECT-space triplanar, not world: a world-space projection is right for
+# terrain and buildings because they never move, but on a driving tank the
+# grain would swim across the hull as it crosses the map.
+static func _unit_relief(src: BaseMaterial3D, faction: int) -> BaseMaterial3D:
+	var key := "%d|%d" % [src.get_instance_id(), faction]
+	if _relief_cache.has(key):
+		return _relief_cache[key]
+	var plate: String = EFBuildings.FAC_PLATE.get(faction, "rusty_metal_02")
+	var npath := "res://textures/%s_nor_gl.jpg" % plate
+	var rpath := "res://textures/%s_Rough.jpg" % plate
+	if not ResourceLoader.exists(npath):
+		# still honour baked AO even without a plate texture to add
+		var plain: BaseMaterial3D = src.duplicate()
+		plain.vertex_color_use_as_albedo = true
+		_relief_cache[key] = plain
+		return plain
+	var d: BaseMaterial3D = src.duplicate()
+	# Pipeline models carry ambient occlusion baked into COLOR_0. Without this
+	# the flat faction tint swallows every panel line and rivet the concept art
+	# carved, and the unit reads as one coloured blob from the RTS camera.
+	d.vertex_color_use_as_albedo = true
+	d.normal_enabled = true
+	d.normal_texture = load(npath)
+	d.normal_scale = 0.55             # gentler than a building: these are small
+	if ResourceLoader.exists(rpath):
+		d.roughness_texture = load(rpath)
+	d.uv1_triplanar = true
+	d.uv1_world_triplanar = false
+	d.uv1_scale = Vector3(3.0, 3.0, 3.0)
+	_relief_cache[key] = d
+	return d
 
 
 # Called on every scene (re)load: the cache keys are source-material instance
@@ -1077,6 +1277,9 @@ static var _tint_cache := {}          # "%d|%d" % [src material id, faction] -> 
 static func reset_visual_caches() -> void:
 	_tint_cache.clear()
 	_squad_mesh_cache.clear()
+	_relief_cache.clear()
+	_squad_tint_cache.clear()
+	_veh_mesh_cache.clear()
 
 
 # ============================ SQUAD INFANTRY ==================================
@@ -1090,14 +1293,22 @@ static func reset_visual_caches() -> void:
 # MultiMesh, and six men cost 9 instanced draws instead of 162.
 
 const SQUAD_N := 6
+# Widened ~1.4x from the original huddle: six 1.75 m men stood inside a
+# 0.6 m circle, which read as penguins jostling on one spot. The section now
+# occupies ~1.0 m — still overflowing its collision radius on purpose (a squad
+# IS a crowd), with _separate giving inf pairs extra room so two sections
+# no longer merge into a single mass on the march.
 const SQUAD_OFFS: Array[Vector2] = [
-	Vector2(0.0, -0.26), Vector2(-0.30, -0.05), Vector2(0.30, -0.05),
-	Vector2(-0.15, 0.24), Vector2(0.15, 0.24), Vector2(0.0, 0.50),
+	Vector2(0.0, -0.48), Vector2(-0.42, -0.20), Vector2(0.42, -0.20),
+	Vector2(-0.21, 0.20), Vector2(0.21, 0.20), Vector2(0.0, 0.52),
 ]
 
 static var _squad_mesh_cache := {}
 
 var _squad_mm: MultiMeshInstance3D = null
+const STRIDE_LEN := 0.62        # metres of ground per leg swing
+var _gait := 0.0                # gait phase, advanced by distance travelled
+var _gait_amt := 0.0            # 0 standing, 1 striding — eased so halts settle
 var _squad_order: Array[int] = []       # which slot dies first — stable per unit
 var _squad_fall: Array[float] = []      # 0 = standing, 1 = fallen
 var _squad_jitter: Array[Vector3] = []  # x, z, yaw wobble so six men differ
@@ -1105,10 +1316,71 @@ var _squad_phase: Array[float] = []     # bob phase per man
 var _squad_alive := SQUAD_N
 var _squad_spread := 1.0
 var _squad_t := 0.0
+var _fire_kick := 0.0                   # 1 at the muzzle flash, gone in ~0.3 s
 
 
 func squad_alive() -> int:
 	return _squad_alive
+
+
+func squad_fire_kick() -> void:
+	_fire_kick = 1.0
+
+
+# The walk lives in squad_walk.gdshader, driven by UV limb tags and
+# INSTANCE_CUSTOM — so a section is only animated if its surfaces actually RUN
+# that shader. The bake used to hand out plain StandardMaterial3Ds, which is
+# why a marching section stayed rigid: the gait pipeline existed end to end,
+# and no material ever executed it.
+static func _squad_walk_wrap(src: Material) -> Material:
+	var key := src.get_instance_id()
+	if _squad_walk_cache.has(key):
+		return _squad_walk_cache[key]
+	var sh := load("res://squad_walk.gdshader") as Shader
+	if sh == null or not (src is BaseMaterial3D):
+		return src
+	var b := src as BaseMaterial3D
+	var m := ShaderMaterial.new()
+	m.shader = sh
+	m.set_shader_parameter("albedo", b.albedo_color)
+	m.set_shader_parameter("rough", b.roughness)
+	m.set_shader_parameter("metal", b.metallic)
+	if b.emission_enabled:
+		m.set_shader_parameter("emission_col", b.emission)
+		m.set_shader_parameter("emission_energy", b.emission_energy_multiplier)
+	_squad_walk_cache[key] = m
+	return m
+
+
+static var _squad_role_cache := {}
+
+
+# The helmet/boots/kit materials for pipeline soldiers. The helmet wears the
+# faction ACCENT — Aurelia's brass, Luminar's pale enamel — which is what makes
+# a 27-px figure read as belonging to its concept instead of being one flat
+# colour poured over a statue.
+static func _squad_role_mat(role: String, fac: int) -> Material:
+	var key := "%s|%d" % [role, fac]
+	if _squad_role_cache.has(key):
+		return _squad_role_cache[key]
+	var f: Dictionary = EFWorld.FACTIONS.get(fac, EFWorld.FACTIONS[1])
+	var m := StandardMaterial3D.new()
+	match role:
+		"trim":
+			m.albedo_color = f.get("accent", Color(0.6, 0.6, 0.6))
+			# half the vehicle trim's metal: a helmet is painted steel, not
+			# polished brightwork, and full mirror flashed white at squad size
+			m.metallic = float(f.get("acc_metal", 0.6)) * 0.5
+			m.roughness = maxf(0.5, float(f.get("acc_rough", 0.5)))
+		"boot":
+			m.albedo_color = Color(0.11, 0.10, 0.095)
+			m.roughness = 0.9
+		_:
+			m.albedo_color = Color(0.22, 0.22, 0.23)
+			m.metallic = 0.55
+			m.roughness = 0.5
+	_squad_role_cache[key] = m
+	return m
 
 
 static func _bake_squad_mesh(fac: int, variant: String) -> ArrayMesh:
@@ -1117,11 +1389,19 @@ static func _bake_squad_mesh(fac: int, variant: String) -> ArrayMesh:
 	var key := "%d|%s" % [fac, variant]
 	if _squad_mesh_cache.has(key):
 		return _squad_mesh_cache[key]
-	var path := "res://models/unit_soldier.glb"
+	# A per-faction pipeline soldier wins over the shared hand-built one. Its
+	# limbs are already tagged in UV2 by the prep script (a Hunyuan mesh is a
+	# single object, so there are no SD_Leg / SD_Arm node names to read), and
+	# _append_limb honours that tagging instead of overwriting it.
+	var fac_name: String = String(EFWorld.FACTIONS[fac]["name"]).to_lower()
+	var path := "res://models/unit_soldier_%s.glb" % fac_name
+	var pre_tagged := ResourceLoader.exists(path)
+	if not pre_tagged:
+		path = "res://models/unit_soldier.glb"
 	if not ResourceLoader.exists(path):
 		return null
 	var inst: Node3D = (load(path) as PackedScene).instantiate()
-	var col: Color = EFWorld.FACTIONS[fac]["color"]
+	var col: Color = EFWorld.hull_of(fac)
 
 	# group every surface by the material it uses, carrying its node transform
 	var groups := {}                     # Material -> Array[[Mesh, surf, xform]]
@@ -1133,21 +1413,56 @@ static func _bake_squad_mesh(fac: int, variant: String) -> ArrayMesh:
 			var mat := mi.get_active_material(si)
 			if mat == null:
 				continue
+			var lname := mat.resource_name.to_lower()
+			if pre_tagged and lname == "" and si < CUSTOM_SLOT_ROLE.size():
+				# the importer drops names on these glbs (seen on vehicles:
+				# 'u_track' arrived as '') — fall back to the slot convention
+				lname = ("u_" + CUSTOM_SLOT_ROLE[si]) if si > 0 else "unit_tint"
 			var use_mat: Material = mat
-			if "tint" in mat.resource_name.to_lower():
+			if "tint" in lname:
+				# A SEPARATE cache from _tint_cache on purpose. That one now
+				# carries normal-mapped relief for vehicles, and a normal map
+				# needs TANGENTS — which SurfaceTool.append_from + commit does
+				# not generate. Feeding it in here rendered every section as
+				# Godot's magenta/white missing-texture checkerboard.
 				var tkey := "%d|%d" % [mat.get_instance_id(), fac]
-				if not _tint_cache.has(tkey):
+				if not _squad_tint_cache.has(tkey):
 					var dup: Material = mat.duplicate()
 					if dup is BaseMaterial3D:
 						(dup as BaseMaterial3D).albedo_color = col.darkened(0.12)
-					_tint_cache[tkey] = dup
-				use_mat = _tint_cache[tkey]
+					_squad_tint_cache[tkey] = dup
+				use_mat = _squad_tint_cache[tkey]
+			elif pre_tagged and lname.begins_with("u_trim"):
+				use_mat = _squad_role_mat("trim", fac)
+			elif pre_tagged and lname.begins_with("u_track"):
+				use_mat = _squad_role_mat("boot", fac)
+			elif pre_tagged and lname.begins_with("u_steel"):
+				use_mat = _squad_role_mat("steel", fac)
+			else:
+				# Pull the pale kit down and lift the near-black helmet. A man is
+				# only ~27 px tall from the RTS camera, and that much contrast
+				# inside one figure hard-edges into blocks at that size.
+				var ckey := "sq|%s|%d" % [mat.resource_name, fac]
+				if not _squad_tint_cache.has(ckey):
+					var cd: Material = mat.duplicate()
+					if cd is BaseMaterial3D:
+						var bm := cd as BaseMaterial3D
+						var a := bm.albedo_color
+						var lum := a.r * 0.30 + a.g * 0.59 + a.b * 0.11
+						# pull every shade toward mid grey, keeping its hue
+						var t := 0.34 if lum > 0.5 else 0.26
+						bm.albedo_color = a.lerp(Color(0.42, 0.40, 0.38), t)
+					_squad_tint_cache[ckey] = cd
+				use_mat = _squad_tint_cache[ckey]
 			# the lance warden's rifle glows instead of a runtime find_child
 			if variant == "lance_warden" and "rifle" in String(mi.name).to_lower():
 				use_mat = _kit_mat("arc")
+			# a plain material would leave this surface rigid mid-march
+			if pre_tagged:
+				use_mat = _squad_walk_wrap(use_mat)
 			if not groups.has(use_mat):
 				groups[use_mat] = []
-			groups[use_mat].append([mi.mesh, si, mi.transform])
+			groups[use_mat].append([mi.mesh, si, mi.transform, mi.name])
 
 	var out := ArrayMesh.new()
 	for mat2 in groups:
@@ -1155,12 +1470,271 @@ static func _bake_squad_mesh(fac: int, variant: String) -> ArrayMesh:
 		st.begin(Mesh.PRIMITIVE_TRIANGLES)
 		for entry in groups[mat2]:
 			var e: Array = entry
+			# append_from, NOT the hand-rolled limb walker below: emitting the
+			# vertices manually to stamp UV2 limb tags rendered every section as
+			# a black-and-white checkerboard, and four different fixes (normals,
+			# winding, buffer layout, material conversion) all failed to explain
+			# it. Reverted to the known-good path until that is understood; the
+			# gait shader and _append_limb are left in place for that work.
 			st.append_from(e[0] as Mesh, int(e[1]), e[2] as Transform3D)
 		st.commit(out)
 		out.surface_set_material(out.get_surface_count() - 1, mat2 as Material)
 	inst.queue_free()
 	_squad_mesh_cache[key] = out
 	return out
+
+
+# Which limb a part belongs to, from its node name, and the height it pivots
+# about. Grouping by MATERIAL alone could never carry this — the legs and the
+# helmet share u_dark — so it has to travel per-vertex, in UV2.
+const HIP_Y := 0.565
+const SHOULDER_Y := 0.95
+
+
+static func _limb_of(node_name: String, xform: Transform3D) -> Vector2:
+	var n := node_name.to_lower()
+	var left: bool = xform.origin.x < 0.0
+	if n.begins_with("sd_leg") or n.begins_with("sd_boot") or n.begins_with("sd_puttee"):
+		return Vector2(1.0 if left else 2.0, HIP_Y)
+	if n.begins_with("sd_arm") or n.begins_with("sd_hand") or n.begins_with("sd_rifle"):
+		# the rifle is carried, so it must swing with the arms or it detaches
+		return Vector2(3.0 if left else 4.0, SHOULDER_Y)
+	return Vector2(0.0, 0.0)
+
+
+static var _veh_mesh_cache := {}      # "model|faction" -> baked ArrayMesh
+static var _track_shader_mat: ShaderMaterial = null
+
+
+static func _track_mat() -> Material:
+	# one shared material for every tracked hull; per-unit motion comes from
+	# the track_scroll INSTANCE uniform, so sharing costs nothing
+	if _track_shader_mat == null:
+		var sh := load("res://track_scroll.gdshader") as Shader
+		if sh == null:
+			return null
+		_track_shader_mat = ShaderMaterial.new()
+		_track_shader_mat.shader = sh
+	return _track_shader_mat
+
+# Nodes that MOVE independently and therefore cannot be baked into the hull:
+# a propeller has to spin, so it stays its own MeshInstance3D.
+const NO_BAKE := ["prop", "rotor", "blade"]
+
+
+static func _bakeable(node_name: String) -> bool:
+	var n := node_name.to_lower()
+	for s in NO_BAKE:
+		if s in n:
+			return false
+	return true
+
+
+# The same merge the infantry already use, generalised to the vehicle models.
+# A tank .glb is ~45 separate MeshInstance3Ds, so every tank on the field cost
+# 45 draw calls; grouped by material it is 6-9. The propeller is left alone.
+# Per-kind pipeline models carry no UVs and their material names can be lost
+# by the importer — but their PREP SCRIPT guarantees the slot order, so role
+# is derived from the surface index instead of the name.
+const CUSTOM_SLOT_ROLE := ["tint", "track", "steel", "trim"]
+
+
+static var _gunmetal: StandardMaterial3D
+
+
+# Slot 2 is the gun barrel, and a barrel is dark oiled steel on every banner's
+# concept art — it is NOT the faction accent. Keeping it neutral is what lets
+# the brass in slot 3 actually read as trim.
+static func _gunmetal_mat() -> StandardMaterial3D:
+	if _gunmetal == null:
+		_gunmetal = StandardMaterial3D.new()
+		_gunmetal.albedo_color = Color(0.19, 0.19, 0.20)
+		_gunmetal.metallic = 0.80
+		_gunmetal.roughness = 0.42
+		_gunmetal.vertex_color_use_as_albedo = true
+	return _gunmetal
+
+
+static var _accent_cache := {}
+
+
+# The steel slot used to inherit Blender's generic grey, identical on all four
+# banners — so Aurelia's brass, the single most recognisable thing in its
+# concept art, existed nowhere in the game. Each faction now gets its own metal.
+static func _accent_mat(fac: int) -> StandardMaterial3D:
+	if _accent_cache.has(fac):
+		return _accent_cache[fac]
+	var f: Dictionary = EFWorld.FACTIONS.get(fac, EFWorld.FACTIONS[1])
+	var m := StandardMaterial3D.new()
+	m.albedo_color = f.get("accent", Color(0.32, 0.32, 0.34))
+	m.metallic = float(f.get("acc_metal", 0.7))
+	m.roughness = float(f.get("acc_rough", 0.45))
+	m.metallic_specular = 0.75
+	# vertex colours carry the baked AO; without this the trim ignores every
+	# crevice the AO pass darkened and floats off the hull
+	m.vertex_color_use_as_albedo = true
+	if fac == 4:
+		# arc-tech: the Covenant's trim is powered, not just polished
+		m.emission_enabled = true
+		m.emission = f.get("accent", Color.WHITE)
+		m.emission_energy_multiplier = 0.35
+	_accent_cache[fac] = m
+	return m
+
+
+static func _bake_vehicle_mesh(model: String, fac: int, src_root: Node3D,
+		custom := false) -> ArrayMesh:
+	var key := "%s|%d" % [model, fac]
+	if _veh_mesh_cache.has(key):
+		return _veh_mesh_cache[key]
+	var col: Color = EFWorld.hull_of(fac)
+	var groups := {}
+	for child in src_root.find_children("*", "MeshInstance3D", true, false):
+		var mi := child as MeshInstance3D
+		if mi.mesh == null or not _bakeable(String(mi.name)):
+			continue
+		for si in range(mi.mesh.get_surface_count()):
+			var mat := mi.get_active_material(si)
+			if mat == null:
+				continue
+			var use_mat: Material = mat
+			if mat is BaseMaterial3D:
+				var lname := mat.resource_name.to_lower()
+				if custom and lname == "" and si < CUSTOM_SLOT_ROLE.size():
+					# Godot's import dropped the name (observed: 'u_track'
+					# arrived as '') — fall back to the slot convention
+					lname = "u_" + CUSTOM_SLOT_ROLE[si]
+					if si == 0:
+						lname = "unit_tint"
+				if "tint" in lname:
+					var tkey := "veh|%d|%d" % [mat.get_instance_id(), fac]
+					if not _tint_cache.has(tkey):
+						var dup: Material = mat.duplicate()
+						(dup as BaseMaterial3D).albedo_color = col.darkened(0.12)
+						_tint_cache[tkey] = _unit_relief(dup as BaseMaterial3D, fac)
+					use_mat = _tint_cache[tkey]
+				elif lname.begins_with("u_track"):
+					var tm := _track_mat()
+					use_mat = tm if tm != null \
+						else _unit_relief(mat as BaseMaterial3D, fac)
+				elif lname.begins_with("u_trim"):
+					use_mat = _accent_mat(fac)
+				elif lname.begins_with("u_steel") or lname.begins_with("u_dark"):
+					use_mat = _gunmetal_mat()
+				# -v only: this fires once per distinct (model, faction) pair and
+				# is how the stale-import bug was caught — the game was loading a
+				# 3-surface cache of a 4-surface file, so every visual A/B before
+				# it was comparing meshes that had never reached the renderer.
+				if custom and OS.is_stdout_verbose():
+					var alb := "n/a"
+					if use_mat is BaseMaterial3D:
+						alb = str((use_mat as BaseMaterial3D).albedo_color)
+					print("[slot %s] surf %d raw '%s' lname '%s' -> albedo %s"
+						% [key, si, mat.resource_name, lname, alb])
+			if not groups.has(use_mat):
+				groups[use_mat] = []
+			groups[use_mat].append([mi.mesh, si, mi.transform])
+	if custom and OS.is_stdout_verbose() == false:
+		print("[bake %s] groups=%d nodes_walked=%d" % [key, groups.size(),
+			src_root.find_children("*", "MeshInstance3D", true, false).size()])
+	if groups.is_empty():
+		return null
+	var out := ArrayMesh.new()
+	for mat2 in groups:
+		var st := SurfaceTool.new()
+		st.begin(Mesh.PRIMITIVE_TRIANGLES)
+		var has_uv := true
+		for entry in groups[mat2]:
+			var e: Array = entry
+			st.append_from(e[0] as Mesh, int(e[1]), e[2] as Transform3D)
+			var arrs: Array = (e[0] as Mesh).surface_get_arrays(int(e[1]))
+			if arrs[Mesh.ARRAY_TEX_UV] == null:
+				has_uv = false
+		# Normal maps without tangents render as garbage, so tangents are
+		# generated — but ONLY when the source has UVs to derive them from.
+		# Hunyuan meshes ship POSITION+NORMAL only, and calling this on them
+		# throws, which silently aborted the whole bake: the pilot tank fell
+		# back to flat tint and the region materials never appeared. Their
+		# relief is object-space triplanar, which needs neither UVs nor
+		# tangents, so skipping is correct, not a compromise.
+		if has_uv:
+			st.generate_tangents()
+		st.commit(out)
+		out.surface_set_material(out.get_surface_count() - 1, mat2 as Material)
+	_veh_mesh_cache[key] = out
+	return out
+
+
+static func _append_limb(st: SurfaceTool, mesh: Mesh, surf: int, xform: Transform3D,
+		node_name: String) -> void:
+	# SurfaceTool.append_from cannot inject an attribute the source lacks, so the
+	# arrays are walked by hand to stamp UV2 with the limb tag.
+	var arrays := mesh.surface_get_arrays(surf)
+	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	if verts.is_empty():
+		return
+	# these three are null, not empty, on a surface that lacks the attribute —
+	# assigning null straight into a typed Packed*Array is a runtime error
+	var norms := PackedVector3Array()
+	if arrays[Mesh.ARRAY_NORMAL] != null:
+		norms = arrays[Mesh.ARRAY_NORMAL]
+	var uvs := PackedVector2Array()
+	if arrays[Mesh.ARRAY_TEX_UV] != null:
+		uvs = arrays[Mesh.ARRAY_TEX_UV]
+	var idx := PackedInt32Array()
+	if arrays[Mesh.ARRAY_INDEX] != null:
+		idx = arrays[Mesh.ARRAY_INDEX]
+	var tag := _limb_of(node_name, xform)
+	var basis := xform.basis
+	var order: PackedInt32Array = idx
+	if order.is_empty():
+		order = PackedInt32Array()
+		for i in range(verts.size()):
+			order.append(i)
+	# A mirrored part (the left boot, arm, puttee...) has a negative-determinant
+	# basis, which REVERSES triangle winding. SurfaceTool.append_from fixes that
+	# for you; emitting vertices by hand does not, so those parts rendered
+	# inside-out under cull_back and the whole section looked like a black and
+	# white checkerboard.
+	var flip: bool = basis.determinant() < 0.0
+	var tris := order.size() / 3
+	for t in range(tris):
+		for c in range(3):
+			var vi: int = order[t * 3 + (2 - c if flip else c)]
+			if norms.size() > vi:
+				st.set_normal((basis * norms[vi]).normalized())
+			if uvs.size() > vi:
+				st.set_uv(uvs[vi])
+			st.set_uv2(tag)
+			st.add_vertex(xform * verts[vi])
+
+
+static var _walk_mat_cache := {}
+
+
+static func _walk_mat(src: Material) -> Material:
+	# A MultiMeshInstance3D has no per-surface override, so the gait cannot live
+	# in a material_override without flattening every colour on the model. Each
+	# surface material becomes a ShaderMaterial instead, carrying its own colour
+	# into the shared walk shader.
+	var key := str(src.get_instance_id())
+	if _walk_mat_cache.has(key):
+		return _walk_mat_cache[key]
+	var sh: Shader = load("res://squad_walk.gdshader")
+	if sh == null or not (src is BaseMaterial3D):
+		push_warning("squad walk shader missing — falling back to flat materials")
+		return src
+	var b := src as BaseMaterial3D
+	var m := ShaderMaterial.new()
+	m.shader = sh
+	m.set_shader_parameter("albedo", b.albedo_color)
+	m.set_shader_parameter("rough", b.roughness)
+	m.set_shader_parameter("metal", b.metallic)
+	if b.emission_enabled:
+		m.set_shader_parameter("emission_col", b.emission)
+		m.set_shader_parameter("emission_energy", b.emission_energy_multiplier)
+	_walk_mat_cache[key] = m
+	return m
 
 
 func _build_squad(col: Color) -> void:
@@ -1171,6 +1745,7 @@ func _build_squad(col: Color) -> void:
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
 	mm.use_colors = true
+	mm.use_custom_data = true       # carries each man's own gait phase
 	mm.mesh = mesh
 	mm.instance_count = SQUAD_N
 	_squad_mm = MultiMeshInstance3D.new()
@@ -1196,8 +1771,11 @@ func _build_squad(col: Color) -> void:
 	_squad_phase = []
 	for i in range(SQUAD_N):
 		_squad_fall.append(0.0)
-		_squad_jitter.append(Vector3(rng.randf_range(-0.07, 0.07),
-			rng.randf_range(-0.44, 0.44), rng.randf_range(-0.07, 0.07)))
+		# Enough scatter to actually break the rows. At +-0.07 against 0.30 m
+		# offsets the six men still stood in a tidy grid, and a grid of small
+		# high-contrast figures at ~27 px on screen reads as a checkerboard.
+		_squad_jitter.append(Vector3(rng.randf_range(-0.20, 0.20),
+			rng.randf_range(-0.6, 0.6), rng.randf_range(-0.17, 0.17)))
 		_squad_phase.append(rng.randf() * TAU)
 	_squad_alive = SQUAD_N
 	_squad_write()
@@ -1222,7 +1800,20 @@ func squad_tick(dt: float) -> void:
 		target_spread *= 1.15                 # light feet: looser order
 	_squad_spread = lerpf(_squad_spread, target_spread, minf(dt * 2.4, 1.0))
 
-	var moving := false
+	# The gait advances with GROUND COVERED, not with time — driving it off TIME
+	# is exactly what makes feet skate along underneath a walking man.
+	var sp := vel.length()
+	_gait += (sp * dt) / STRIDE_LEN * PI
+	if _gait > TAU:
+		_gait -= TAU
+	var want_amt := 1.0 if sp > 0.30 else 0.0
+	var prev_amt := _gait_amt
+	_gait_amt = move_toward(_gait_amt, want_amt, dt * 3.5)
+
+	var moving := not is_equal_approx(prev_amt, _gait_amt) or _gait_amt > 0.001
+	if _fire_kick > 0.0:
+		_fire_kick = maxf(0.0, _fire_kick - dt * 3.2)
+		moving = true
 	for i in range(SQUAD_N):
 		var slot: int = _squad_order.find(i)
 		var down := slot >= _squad_alive
@@ -1240,9 +1831,6 @@ func _squad_write() -> void:
 	if _squad_mm == null:
 		return
 	var mm := _squad_mm.multimesh
-	var buf := PackedFloat32Array()
-	buf.resize(SQUAD_N * 16)
-	var stride := float(vel.length()) / maxf(speed, 0.001)
 	for i in range(SQUAD_N):
 		var off: Vector2 = SQUAD_OFFS[i] * _squad_spread
 		var j: Vector3 = _squad_jitter[i]
@@ -1257,22 +1845,21 @@ func _squad_write() -> void:
 			basis = basis * Basis(Vector3.RIGHT, -fall * 1.4)
 			pos.y -= fall * 0.10
 			basis = basis.scaled(Vector3.ONE * maxf(1.0 - fall, 0.02))
-		else:
-			var bob := sin(_squad_t * 6.0 + _squad_phase[i]) * 0.035 * stride
-			pos.y += bob
-		var t := Transform3D(basis, pos)
-		var b := i * 16
-		buf[b + 0] = t.basis.x.x; buf[b + 1] = t.basis.y.x
-		buf[b + 2] = t.basis.z.x; buf[b + 3] = t.origin.x
-		buf[b + 4] = t.basis.x.y; buf[b + 5] = t.basis.y.y
-		buf[b + 6] = t.basis.z.y; buf[b + 7] = t.origin.y
-		buf[b + 8] = t.basis.x.z; buf[b + 9] = t.basis.y.z
-		buf[b + 10] = t.basis.z.z; buf[b + 11] = t.origin.z
-		# a whisper of brightness variation so six men are not one man stamped
-		var shade := 0.94 + 0.12 * fposmod(float(i) * 0.37 + _squad_phase[i], 1.0)
-		buf[b + 12] = shade; buf[b + 13] = shade
-		buf[b + 14] = shade; buf[b + 15] = 1.0
-	mm.buffer = buf
+		# the vertical bob now lives in the shader, at twice stride frequency
+		# and a fraction of the amplitude — the old whole-body hop on a single
+		# sine is what made a marching section look like bouncing toys
+		# Written through the explicit setters rather than by packing mm.buffer
+		# by hand: the raw per-instance layout interleaves transform, colour and
+		# custom data, and guessing that order wrong put the gait phase into the
+		# colour slot, which tinted every man by a different large number and
+		# rendered a section as a bright/dark checkerboard.
+		mm.set_instance_transform(i, Transform3D(basis, pos))
+		mm.set_instance_color(i, Color(1, 1, 1, 1))
+		# gait phase, gait amount, per-man brightness jitter
+		var fallen: float = 0.0 if fall > 0.001 else _gait_amt
+		mm.set_instance_custom_data(i, Color(
+			_gait + _squad_phase[i], fallen,
+			fposmod(float(i) * 0.37 + _squad_phase[i], 1.0), _fire_kick))
 
 
 func _apply_tint(root: Node3D, col: Color) -> void:
@@ -1282,7 +1869,10 @@ func _apply_tint(root: Node3D, col: Color) -> void:
 			continue
 		for i in range(mi.mesh.get_surface_count()):
 			var m := mi.get_active_material(i)
-			if m != null and "tint" in m.resource_name.to_lower():
+			if m == null or not (m is BaseMaterial3D):
+				continue
+			var lname := m.resource_name.to_lower()
+			if "tint" in lname:
 				# cached per (source material, faction): the glb PackedScene is
 				# resource-cached so sources are shared, meaning a whole army
 				# shares a handful of materials instead of one per surface per
@@ -1292,8 +1882,16 @@ func _apply_tint(root: Node3D, col: Color) -> void:
 					var dup: Material = m.duplicate()
 					if dup is BaseMaterial3D:
 						(dup as BaseMaterial3D).albedo_color = col.darkened(0.12)
-					_tint_cache[key] = dup
+						_tint_cache[key] = _unit_relief(dup as BaseMaterial3D, faction)
+					else:
+						_tint_cache[key] = dup
 				mi.set_surface_override_material(i, _tint_cache[key])
+			elif lname.begins_with("u_steel") or lname.begins_with("u_dark") \
+					or lname.begins_with("u_track"):
+				# the hull's unpainted metalwork gets the grain too — it is the
+				# bulk of what the eye reads on a tank from above
+				mi.set_surface_override_material(i,
+					_unit_relief(m as BaseMaterial3D, faction))
 
 
 # ============================ THE FACTION KIT =================================
@@ -1490,10 +2088,197 @@ const INSIG_QUADS := {
 }
 
 
+# The table above is hand-measured against a specific mesh, which is exactly
+# why it breaks on pipeline models: re-carving a hull moves every surface it
+# was measured from, and the roundels end up hovering beside the wing or buried
+# inside it. These entries give a target as a FRACTION of the hull's bounding
+# box; the quad is then snapped onto the nearest real surface at that spot, so
+# it lands on the skin no matter what the mesh turns out to be.
+#   "y" = flat on the upper surface, frac reads (x, -, z)
+#   "x" = on the flank, frac reads (-, y, z), mirrored to both sides
+const CUSTOM_INSIG := {
+	"sparrowhawk": [[Vector3(0.22, 0.0, 0.48), 0.42, "y"],
+		[Vector3(0.78, 0.0, 0.48), 0.42, "y"]],
+	"pelican": [[Vector3(0.17, 0.0, 0.46), 0.55, "y"],
+		[Vector3(0.83, 0.0, 0.46), 0.55, "y"]],
+	"kondor": [[Vector3(0.18, 0.0, 0.50), 0.50, "y"],
+		[Vector3(0.82, 0.0, 0.50), 0.50, "y"]],
+	"duster": [[Vector3(0.18, 0.0, 0.45), 0.44, "y"],
+		[Vector3(0.82, 0.0, 0.45), 0.44, "y"]],
+	# these two wear it on the upper surface, not the flank: the RTS camera
+	# looks down at 52 degrees, and a quad on the side of an airship hull is
+	# edge-on to it — present in the mesh, invisible in the game
+	"wasp": [[Vector3(0.5, 0.0, 0.78), 0.24, "y"]],
+	"leviathan": [[Vector3(0.5, 0.0, 0.38), 0.80, "y"]],
+	# ground vehicles wear it on the roof, where the RTS camera can see it
+	"pavise": [[Vector3(0.5, 0.0, 0.62), 0.34, "y"]],
+	"zephyr": [[Vector3(0.5, 0.0, 0.35), 0.30, "y"]],
+	"dart": [[Vector3(0.5, 0.0, 0.55), 0.30, "y"]],
+	"dray": [[Vector3(0.5, 0.0, 0.30), 0.32, "y"]],
+	"keelwright": [[Vector3(0.5, 0.0, 0.60), 0.50, "y"]],
+	# Luminar wear it on their heavy hulls only. Faction 4's insignia material
+	# emits (see insignia_mat), so this doubles as their arc-light signature —
+	# putting one on every truck as well would turn a signature into wallpaper.
+	"faraday": [[Vector3(0.5, 0.0, 0.45), 0.34, "y"]],
+	"ark_carriage": [[Vector3(0.5, 0.0, 0.55), 0.50, "y"]],
+	"cathedral": [[Vector3(0.5, 0.0, 0.40), 0.70, "y"]],
+	"seraph": [[Vector3(0.26, 0.0, 0.58), 0.34, "y"],
+		[Vector3(0.74, 0.0, 0.58), 0.34, "y"]],
+}
+
+static var _fit_insig_meshes := {}
+
+
+# Snap each fractional target onto the hull's actual skin. A quad is accepted
+# only if real geometry sits under it — a target that misses the mesh is
+# dropped rather than left floating in air.
+static func _fit_quads(verts: PackedVector3Array, hull: AABB, spec: Array) -> Array:
+	var out: Array = []
+	for q in spec:
+		var f: Vector3 = q[0]
+		var size: float = q[1]
+		var half: float = size * 0.5
+		if String(q[2]) == "y":
+			var tx: float = hull.position.x + hull.size.x * f.x
+			var tz: float = hull.position.z + hull.size.z * f.z
+			var top := _probe(verts, tx, tz, 0, 2, 1, true)
+			if top == Vector3.INF:
+				continue
+			out.append([top + Vector3(0, 0.03, 0), size, "y"])
+		else:
+			var ty: float = hull.position.y + hull.size.y * f.y
+			var tz2: float = hull.position.z + hull.size.z * f.z
+			var flank := 0.0
+			for v in verts:
+				if absf(v.y - ty) <= half and absf(v.z - tz2) <= half:
+					flank = maxf(flank, absf(v.x))
+			if flank <= 0.0:
+				continue
+			out.append([Vector3(flank + 0.03, ty, tz2), size, "x"])
+			out.append([Vector3(-flank - 0.03, ty, tz2), size, "x"])
+
+	# A mirrored pair has to sit at the same height. On the Kondor's twin tail
+	# the starboard probe latched onto a fin top — "highest geometry here" is
+	# the right rule for a roof and the wrong one when something sticks up out
+	# of the wing — and left that roundel hanging above the airframe. Levelling
+	# every "y" quad in a spec to its LOWEST hit picks the wing in that case and
+	# changes nothing for a spec that only has one.
+	var flat: Array = []
+	for q in out:
+		if String(q[2]) == "y":
+			flat.append(q)
+	if flat.size() > 1:
+		var low := INF
+		for q in flat:
+			low = minf(low, float(q[0].y))
+		for q in flat:
+			q[0] = Vector3(q[0].x, low, q[0].z)
+	return out
+
+
+# The baked mesh hangs under the glb root's axis-conversion transform, so its
+# vertices need walking back up into the body's own space before anything can
+# be positioned against them.
+static var _hull_vert_cache := {}
+
+
+func _hull_verts() -> PackedVector3Array:
+	# cached per kind: every unit of a kind loads the same glb under the same
+	# node tree, and the Cathedral alone is 60k vertices to walk on every spawn
+	if _hull_vert_cache.has(kind):
+		return _hull_vert_cache[kind]
+	var verts := PackedVector3Array()
+	if _merged == null or _merged.mesh == null:
+		return verts
+	var xf := Transform3D.IDENTITY
+	var n: Node3D = _merged
+	while n != null and n != _body:
+		xf = n.transform * xf
+		n = n.get_parent() as Node3D
+	for si in range(_merged.mesh.get_surface_count()):
+		var arr: Array = _merged.mesh.surface_get_arrays(si)
+		for v in (arr[Mesh.ARRAY_VERTEX] as PackedVector3Array):
+			verts.append(xf * v)
+	_hull_vert_cache[kind] = verts
+	return verts
+
+
+func _hull_box(verts: PackedVector3Array) -> AABB:
+	var box := AABB(verts[0], Vector3.ZERO)
+	for v in verts:
+		box = box.expand(v)
+	return box
+
+
+# A Luminar hull with no arc light is just a violet truck. The procedural coils
+# in _dress() are positioned against the meshes they were built for, so pipeline
+# models skip them and take this instead: one emissive orb snapped onto the real
+# hull, which survives any re-carve.
+const CUSTOM_GLOW := {
+	"glimmer": [Vector3(0.5, 0.0, 0.30), 0.13],
+	"faraday": [Vector3(0.5, 0.0, 0.70), 0.16],
+	"ion_carriage": [Vector3(0.5, 0.0, 0.62), 0.14],
+	"collector": [Vector3(0.5, 0.0, 0.66), 0.16],
+	"dynamo": [Vector3(0.5, 0.0, 0.64), 0.20],
+	"ark_carriage": [Vector3(0.5, 0.0, 0.26), 0.20],
+	"seraph": [Vector3(0.5, 0.0, 0.84), 0.13],
+	"cathedral": [Vector3(0.5, 0.0, 0.78), 0.26],
+}
+
+
+func _add_custom_glow() -> void:
+	if not custom_model or not CUSTOM_GLOW.has(kind):
+		return
+	var verts := _hull_verts()
+	if verts.is_empty():
+		return
+	var hull := _hull_box(verts)
+	var spec: Array = CUSTOM_GLOW[kind]
+	var f: Vector3 = spec[0]
+	var r: float = spec[1]
+	var top := _probe(verts, hull.position.x + hull.size.x * f.x,
+		hull.position.z + hull.size.z * f.z, 0, 2, 1, true)
+	if top == Vector3.INF:
+		return
+	var orb := SphereMesh.new()
+	orb.radius = r
+	orb.height = r * 2.0
+	orb.radial_segments = 12
+	orb.rings = 6
+	var mi := MeshInstance3D.new()
+	mi.mesh = orb
+	mi.material_override = _kit_mat("arc")
+	mi.position = top + Vector3(0, r * 0.55, 0)
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_body.add_child(mi)
+
+
+func _fitted_insignia() -> ArrayMesh:
+	if _fit_insig_meshes.has(kind):
+		return _fit_insig_meshes[kind]
+	var verts := _hull_verts()
+	if verts.is_empty():
+		return null
+	var hull := AABB(verts[0], Vector3.ZERO)
+	for v in verts:
+		hull = hull.expand(v)
+	var quads := _fit_quads(verts, _hull_box(verts), CUSTOM_INSIG[kind])
+	if quads.is_empty():
+		return null
+	var mesh := _build_insig_mesh(quads)
+	_fit_insig_meshes[kind] = mesh
+	return mesh
+
+
 static func _insignia_mesh(kind_key: String) -> ArrayMesh:
 	if _insig_meshes.has(kind_key):
 		return _insig_meshes[kind_key]
-	var quads: Array = INSIG_QUADS[kind_key]
+	var mesh := _build_insig_mesh(INSIG_QUADS[kind_key])
+	_insig_meshes[kind_key] = mesh
+	return mesh
+
+
+static func _build_insig_mesh(quads: Array) -> ArrayMesh:
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	for q in quads:
@@ -1512,9 +2297,7 @@ static func _insignia_mesh(kind_key: String) -> ArrayMesh:
 				st.set_uv(uvs[idx])
 				st.set_normal(Vector3.UP if q[2] == "y" else Vector3.RIGHT)
 				st.add_vertex(corners[idx])
-	var mesh := st.commit()
-	_insig_meshes[kind_key] = mesh
-	return mesh
+	return st.commit()
 
 
 func _add_piece(mesh_name: String, mat: Material, pos: Vector3,
@@ -1531,10 +2314,16 @@ func _add_piece(mesh_name: String, mat: Material, pos: Vector3,
 
 
 func _add_insignia() -> void:
-	if not INSIG_QUADS.has(kind):
+	var mesh: ArrayMesh = null
+	if custom_model and CUSTOM_INSIG.has(kind):
+		mesh = _fitted_insignia()
+	elif INSIG_QUADS.has(kind):
+		mesh = _insignia_mesh(kind)
+	if mesh == null:
 		return
 	var mi := MeshInstance3D.new()
-	mi.mesh = _insignia_mesh(kind)
+	_insig_mi = mi
+	mi.mesh = mesh
 	mi.material_override = insignia_mat(faction)
 	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	_body.add_child(mi)
@@ -1549,6 +2338,11 @@ func _add_insignia() -> void:
 
 func _dress() -> void:
 	_add_insignia()
+	_add_custom_glow()
+	if custom_model:
+		# a per-kind pipeline model carries its own stacks/plates/detail —
+		# the procedural pieces below would float through its silhouette
+		return
 	var iron := _kit_mat("iron")
 	var rust := _kit_mat("rust")
 	var brass := _kit_mat("brass")
@@ -1657,9 +2451,9 @@ func _dress() -> void:
 						(lance as MeshInstance3D).material_override = arc
 
 
-func _make_shadow() -> void:
+func _make_shadow(sz := Vector2(1.9, 2.3)) -> void:
 	var sh_mesh := PlaneMesh.new()
-	sh_mesh.size = Vector2(1.9, 2.3)
+	sh_mesh.size = sz
 	var sm := StandardMaterial3D.new()
 	sm.albedo_color = Color(0, 0, 0, 0.3)
 	sm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA

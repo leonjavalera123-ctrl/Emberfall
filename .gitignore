@@ -23,6 +23,12 @@ dist/*
 /godot/*.png
 /godot/*.png.import
 
+# Stray files from a mistyped flag. Running the game with `--room=skirmish`
+# instead of `--room skirmish` makes Godot treat the flag itself as an output
+# path, leaving 1280x720 screenshots named `--room-skirmish` in godot/ with no
+# extension, so the *.png rule above misses them.
+/godot/--*
+
 # ─── Addon binaries for platforms we don't target ───────────────────────
 # Debug Draw 3D ships native libs for 6 platforms (41 MB total); Windows is
 # 4.2 MB of that. Linux is kept for a future Steam Deck build. The files stay

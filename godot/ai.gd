@@ -17,23 +17,53 @@ extends Node
 const THINK := 0.5
 const DEFEND_RADIUS := 30.0
 
+# --- forward expansion -------------------------------------------------------
+# A commander that only ever mines its opening field loses the long game. From
+# STANDARD upward it eventually buys a crawler, escorts it to a rich deposit it
+# does not already own, and founds a second front there.
+const EXPAND_DRIVE_TIMEOUT := 90.0   # seconds to reach the site before aborting
+const EXPAND_QUEUE_TIMEOUT := 45.0   # seconds to wait for a crawler that may never come
+const EXPAND_SITE_RETRIES := 3       # failures before this map is declared hopeless
+const EXPAND_COOLDOWN := 60.0        # base backoff, multiplied by the failure count
+const EXPAND_CLUSTER_GAP := 3        # tiles apart that still count as one deposit
+
 var muster_size := 10
 var wave_cooldown := 25.0
 var allow_sw := true
 var tech_limit := ""        # "infantry" caps the camp at barracks-grade war
 
 
+var diff_lvl := 2               # kept so behaviour ticks can gate on difficulty
+
+
 func set_difficulty(d: int) -> void:
+	diff_lvl = d
 	match d:
-		1:      # EASY — smaller waves, long breathers, no doomsday
+		1:      # EASY — smaller waves, long breathers, no doomsday, one base
 			muster_size = 8
 			wave_cooldown = 40.0
 			allow_sw = false
-		3:      # BRUTAL — big waves, short breathers
+			expand_max = 0
+		3:      # BRUTAL — big waves, short breathers, and it SPREADS
 			muster_size = 14
 			wave_cooldown = 15.0
-		_:
-			pass
+			expand_max = 2          # saturates the three-post cap
+			expand_after = 180.0
+			expand_reach = 80
+			expand_escort = 5
+			expand_credits = 2800
+			expand_army = 6
+			_exp_q = ["refinery", "gun_turret", "gun_turret", "gun_turret",
+				"barracks", "boiler"]
+		_:      # STANDARD — must be written out, not left to fall through: the
+				# 2v2 ally is constructed with set_difficulty(2)
+			expand_max = 1
+			expand_after = 300.0
+			expand_reach = 55
+			expand_escort = 4
+			expand_credits = 3200
+			expand_army = 8
+			_exp_q = ["refinery", "gun_turret", "gun_turret"]
 
 var world: EFWorld
 var army: EFArmy
@@ -72,6 +102,28 @@ var _lift_troops: Array = []
 var _lift_state := "idle"    # idle / loading / inbound / returning
 var _lift_t := 0.0           # sortie watchdog
 
+# expansion state
+var expand_max := 1          # extra posts beyond the capital; 0 = never expands
+var expand_after := 300.0    # game seconds before the first attempt
+var expand_reach := 55       # furthest candidate field, in tiles
+var expand_escort := 4
+var expand_credits := 3200
+var expand_army := 8
+var _age := 0.0
+var _exp_state := "idle"     # idle / queued / driving / building
+var _exp_mcv: EFUnit = null
+var _exp_site := Vector2i(-1, -1)
+var _exp_alts: Array = []    # fallback origins at the same field
+var _exp_anchor := Vector2i(-1, -1)
+var _exp_escort_units: Array = []
+var _exp_t := 0.0
+var _exp_cd := 0.0
+var _exp_fails := 0
+var _exp_pulse := 0.0
+var _exp_q: Array = []       # what the forward base builds once founded
+var _exp_built := 0
+var _fields: Array = []      # [{tiles, center}] clustered ember deposits
+
 
 func setup(w: EFWorld, a: EFArmy, eco: EFEconomy, bld: EFBuildings, faction: int,
 		foe: int, foes: Array = []) -> void:
@@ -108,6 +160,7 @@ func setup(w: EFWorld, a: EFArmy, eco: EFEconomy, bld: EFBuildings, faction: int
 		_harv_kind = "collector"
 		_air_kind = "seraph"
 		_super_kind = "cathedral"
+	_build_field_cache()
 
 
 func _process(dt: float) -> void:
@@ -116,6 +169,10 @@ func _process(dt: float) -> void:
 	_lift_t = maxf(0.0, _lift_t - dt)
 	_advance_jobs(dt)
 	_site_t = maxf(0.0, _site_t - dt)
+	_age += dt
+	_exp_cd = maxf(0.0, _exp_cd - dt)
+	_exp_t = maxf(0.0, _exp_t - dt)
+	_exp_pulse = maxf(0.0, _exp_pulse - dt)
 	_discover_tick(dt)
 	_think -= dt
 	if _think > 0.0:
@@ -134,6 +191,9 @@ func _process(dt: float) -> void:
 	_deploy_tick()
 	if buildings.count_posts(fac) == 0:
 		return          # nothing else is possible until the base is founded
+	# survival outranks ambition: _deploy_tick and the guard above run first
+	_expand_tick(dt)
+	_stance_tick()
 	_defend_check()
 	_airlift_tick()
 	match state:
@@ -141,10 +201,26 @@ func _process(dt: float) -> void:
 			if cur_build.is_empty():
 				if build_q.is_empty():
 					state = "ECONOMY"
-				elif _start_build(build_q[0]):
+				elif _start_build(String(build_q[0])):
+					build_q.pop_front()
+				elif not buildings.prereq_ok(String(build_q[0]), fac):
+					# An item whose prereq cannot be met from here would pin the
+					# opening forever: the queue only ever popped what it managed
+					# to START. On a crawler landing there is no free refinery,
+					# so "vehicle_works" sat at the head failing every tick — and
+					# the refinery that would unblock it is only built in
+					# ECONOMY, which OPENING never reached. The whole brain
+					# deadlocked: no economy, no troops, for the entire match.
+					# Skip it and let ECONOMY pick it up once the tech exists.
 					build_q.pop_front()
 		"ECONOMY":
-			if cur_build.is_empty() and buildings.low_power(fac):
+			if cur_build.is_empty() and _exp_state == "building" \
+					and not _exp_q.is_empty() \
+					and economy.credits.get(fac, 0) >= 1500:
+				# the new front gets its refinery and guns before the capital
+				# spends its surplus on a doomworks
+				_expand_build()
+			elif cur_build.is_empty() and buildings.low_power(fac):
 				_start_build("boiler")
 			elif cur_build.is_empty() and not buildings._owns(fac, "refinery") 					and buildings.prereq_ok("refinery", fac):
 				_start_build("refinery")
@@ -175,6 +251,10 @@ func _process(dt: float) -> void:
 		"MUSTER":
 			var mil := _military()
 			if mil.size() >= muster_size and attack_cd <= 0.0:
+				# stand the garrison up before the march: dug-in infantry are
+				# PINNED, and recruiting them into a wave without mobilizing
+				# left them rooted at home while the wave died short-handed
+				_mobilize_all()
 				state = "ATTACK"
 			elif cur_train.is_empty():
 				var id: String
@@ -241,10 +321,21 @@ func _advance_jobs(dt: float) -> void:
 	if not cur_build.is_empty():
 		cur_build["t"] -= dt
 		if cur_build["t"] <= 0.0:
-			if buildings.ai_place_near(cur_build["id"], fac, hq_tile):
+			# a forward base builds around ITSELF, not around the capital
+			var anchor: Vector2i = cur_build.get("at", hq_tile)
+			if buildings.ai_place_near(String(cur_build["id"]), fac, anchor):
 				cur_build = {}
 			else:
-				cur_build["t"] = 2.0        # no room right now — retry shortly
+				# do not retry forever: a walled-in anchor would otherwise pin
+				# the whole build queue for the rest of the match
+				var tries: int = int(cur_build.get("tries", 0)) + 1
+				if tries > 8:
+					economy.credits[fac] = economy.credits.get(fac, 0) \
+						+ int(buildings._cost_of(String(cur_build["id"])))
+					cur_build = {}      # refund and move on
+				else:
+					cur_build["tries"] = tries
+					cur_build["t"] = 2.0
 	if not cur_train.is_empty():
 		cur_train["t"] -= dt
 		if cur_train["t"] <= 0.0:
@@ -252,12 +343,13 @@ func _advance_jobs(dt: float) -> void:
 			cur_train = {}
 
 
-func _start_build(id: String) -> bool:
+func _start_build(id: String, at := Vector2i(-1, -1)) -> bool:
 	var cost := buildings._cost_of(id)
 	if economy.credits.get(fac, 0) < cost or not buildings.prereq_ok(id, fac):
 		return false
 	economy.credits[fac] = economy.credits.get(fac, 0) - int(cost)
-	cur_build = {"id": id, "t": cost / 100.0}
+	cur_build = {"id": id, "t": cost / 100.0,
+		"at": at if at.x >= 0 else hq_tile, "tries": 0}
 	return true
 
 
@@ -482,7 +574,15 @@ func _retarget() -> bool:
 	foe_pool = alive
 	if foe_pool.is_empty():
 		return false
+	var was := enemy_fac
 	enemy_fac = _pick_target()
+	if enemy_fac != was:
+		# a rooted gun line aimed at the old target cannot march to the new
+		# one — pack up the vehicles, but leave the home forts standing
+		for u in army.units:
+			if u.faction == fac and u.hp > 0 and not u.is_infantry() \
+					and not u.flying and u.stance != 0:
+				u.set_stance(0)
 	return true
 
 
@@ -573,12 +673,349 @@ func _discover_tick(dt: float) -> void:
 		enemy_fac = _pick_target()
 
 
+# --- stances: the AI fights with the same postures the player has ------------
+
+const STANCE_FORT_CAP := 6
+
+
+func _stance_tick() -> void:
+	if diff_lvl <= 1:
+		return                  # the EASY commander keeps it simple
+	if state != "ATTACK" and state != "WAVE":
+		# between waves, home-guard infantry dig in around the posts
+		var forts := 0
+		for u in army.units:
+			if u.faction == fac and u.hp > 0 and u.fort_ref >= 0:
+				forts += 1
+		if forts >= STANCE_FORT_CAP:
+			return
+		for u2 in army.units:
+			if forts >= STANCE_FORT_CAP:
+				break
+			if u2.faction != fac or u2.hp <= 0 or not u2.is_infantry():
+				continue
+			if u2.stance != 0 or u2.fort_ref >= 0 or u2.garrisoned_in >= 0:
+				continue
+			if not u2.path.is_empty() or u2.tgt_unit != null:
+				continue
+			var d := u2.global_position.distance_to(hq_pos)
+			if d < DEFEND_RADIUS * 0.8 and d > 6.0:
+				u2.set_stance(2)
+				u2.path.clear()
+				army._make_fort(u2)
+				forts += 1
+	elif diff_lvl >= 3 and state == "WAVE":
+		# the BRUTAL gun line: cannon vehicles already inside their deployed
+		# reach of the target base root themselves for the range/damage bonus
+		var hq := _enemy_hq_pos()
+		for u3 in army.units:
+			if u3.faction != fac or u3.hp <= 0 or u3.flying or u3.is_infantry():
+				continue
+			if u3.role != "tank" and u3.role != "smalltank":
+				continue
+			if u3.stance != 0 or u3.weapon.is_empty():
+				continue
+			var rng: float = u3.weapon.get("range", 8.0)
+			var d2 := u3.global_position.distance_to(hq)
+			if d2 < rng * 1.8 and d2 > rng * 0.7:
+				u3.set_stance(1)
+
+
+func _mobilize_all() -> void:
+	# forts dropped, artillery packed up: everyone can march again
+	for u in army.units:
+		if u.faction != fac or u.hp <= 0:
+			continue
+		if u.fort_ref >= 0:
+			army._drop_fort(u.fort_ref, false)
+		if u.stance != 0:
+			u.set_stance(0)
+
+
 func _count_type(type: String) -> int:
 	var n := 0
 	for b in buildings.list:
 		if b["faction"] == fac and b["type"] == type and b["hp"] > 0:
 			n += 1
 	return n
+
+
+# ============================ FORWARD EXPANSION ===============================
+
+func _build_field_cache() -> void:
+	# one flood fill over the map's ember tiles, grouping anything within
+	# EXPAND_CLUSTER_GAP into a single deposit worth founding a base beside
+	_fields = []
+	var seen := {}
+	for t in world.ember_tiles:
+		if seen.has(t):
+			continue
+		var group: Array = []
+		var queue: Array = [t]
+		seen[t] = true
+		while not queue.is_empty():
+			var c: Vector2i = queue.pop_back()
+			group.append(c)
+			for o in world.ember_tiles:
+				if seen.has(o):
+					continue
+				if maxi(absi(o.x - c.x), absi(o.y - c.y)) <= EXPAND_CLUSTER_GAP:
+					seen[o] = true
+					queue.append(o)
+		var cx := 0
+		var cy := 0
+		for g in group:
+			cx += g.x
+			cy += g.y
+		_fields.append({"tiles": group,
+			"center": Vector2i(cx / group.size(), cy / group.size())})
+
+
+func _posts() -> Array:
+	var out: Array = []
+	for b in buildings.list:
+		if b["type"] == "command_post" and b["faction"] == fac and b["hp"] > 0:
+			out.append(b["origin"])
+	return out
+
+
+func _field_value(f: Dictionary) -> float:
+	var total := 0.0
+	for t in f["tiles"]:
+		total += float(economy.reserves.get(t, 0.0))
+	return total
+
+
+func _score_field(f: Dictionary) -> float:
+	var reserve := _field_value(f)
+	if reserve <= 0.0:
+		return -INF                     # mined out; nothing to come for
+	var center: Vector2i = f["center"]
+	var own := _posts()
+	var own_d := 9999
+	for p in own:
+		own_d = mini(own_d, maxi(absi(center.x - p.x), absi(center.y - p.y)))
+	if own_d > expand_reach:
+		return -INF                     # too far to escort a crawler safely
+	var foe_d := 999
+	for b in buildings.list:
+		if b["hp"] <= 0 or not world.is_hostile(fac, int(b["faction"])):
+			continue
+		if not (int(b["faction"]) in known):
+			continue                    # we have not met them; we cannot fear them
+		var bo: Vector2i = b["origin"]
+		foe_d = mini(foe_d, maxi(absi(center.x - bo.x), absi(center.y - bo.y)))
+	var mine := 0.0
+	var theirs := 0.0
+	for b2 in buildings.list:
+		if b2["hp"] <= 0:
+			continue
+		var o2: Vector2i = b2["origin"]
+		if maxi(absi(center.x - o2.x), absi(center.y - o2.y)) > 8:
+			continue
+		if int(b2["faction"]) == fac:
+			mine = 1.0
+		elif world.is_hostile(fac, int(b2["faction"])):
+			theirs = 1.0
+	var score := reserve / 1500.0
+	score -= 0.10 * float(own_d)        # every tile is a longer supply line
+	score += 0.06 * float(foe_d)        # but do not found it in their lap
+	score -= 6.0 * theirs               # someone already lives here
+	score -= 3.0 * mine                 # we already drain this one
+	if own_d < EFBuildings.MCV_SPACING + 6:
+		score -= 2.5                    # too close to be a real second front
+	return score
+
+
+func _pick_expand_site() -> Array:
+	if _fields.is_empty():
+		return []
+	var best: Dictionary = {}
+	var best_score := -INF
+	for f in _fields:
+		var s := _score_field(f)
+		if s > best_score:
+			best_score = s
+			best = f
+	if best.is_empty() or best_score == -INF:
+		return []
+	var center: Vector2i = best["center"]
+	var found: Array = []
+	# The post can never stand ON the field ('E' is not buildable, and a mined
+	# tile becomes ',' which is not either) — so ring outward far enough to
+	# clear the whole deposit.
+	for ring in range(1, 7):
+		for dy in range(-ring, ring + 1):
+			for dx in range(-ring, ring + 1):
+				if maxi(absi(dx), absi(dy)) != ring:
+					continue
+				var origin: Vector2i = center + Vector2i(dx, dy) - Vector2i(1, 1)
+				if not buildings.can_place("command_post", origin, fac, null, true):
+					continue
+				var ok := true
+				for p in _posts():
+					if maxi(absi(p.x - origin.x), absi(p.y - origin.y)) \
+							< EFBuildings.MCV_SPACING:
+						ok = false
+				if ok:
+					found.append(origin)
+			if found.size() >= 3:
+				break
+	return found
+
+
+func _threatened(p: Vector3, r: float) -> bool:
+	for u in army.units:
+		if u.hp <= 0 or not world.is_hostile(fac, u.faction):
+			continue
+		if u.global_position.distance_to(p) < r:
+			return true
+	return false
+
+
+func _find_free_mcv() -> EFUnit:
+	for u in army.units:
+		if u.faction == fac and u.role == "mcv" and u.hp > 0:
+			return u
+	return null
+
+
+func _want_expand() -> bool:
+	if expand_max <= 0 or _exp_state != "idle" or _exp_cd > 0.0:
+		return false
+	if _exp_built >= expand_max:
+		return false
+	if buildings.count_posts(fac) >= EFBuildings.MAX_POSTS:
+		return false
+	if _age < expand_after or state == "ATTACK":
+		return false
+	if not buildings._owns(fac, "refinery") or not buildings._owns(fac, "vehicle_works"):
+		return false
+	if buildings.low_power(fac):
+		return false
+	if economy.credits.get(fac, 0) < expand_credits:
+		return false
+	if _military().size() < expand_army:
+		return false
+	if _defend_pulse > 0.0:
+		return false
+	for p in _posts():
+		var pp := Vector3((p.x + 1.5) * EFWorld.T, 0, (p.y + 1.5) * EFWorld.T)
+		if _threatened(pp, DEFEND_RADIUS):
+			return false                # never expand while the house is burning
+	return true
+
+
+func _pick_escort(n: int) -> Array:
+	var out: Array = []
+	for u in _military():
+		if out.size() >= n:
+			break
+		if u in wave:
+			continue                    # do not strip a committed attack
+		out.append(u)
+	return out
+
+
+func _exp_fail(reason: String) -> void:
+	_exp_fails += 1
+	_exp_cd = EXPAND_COOLDOWN * float(_exp_fails)
+	_exp_state = "idle"
+	_exp_mcv = null
+	_exp_escort_units = []
+	_exp_site = Vector2i(-1, -1)
+	_exp_alts = []
+	if _exp_fails >= EXPAND_SITE_RETRIES:
+		expand_max = 0                  # this map will not take a second front
+	print("[ai %d] expansion aborted: %s" % [fac, reason])
+
+
+func _expand_tick(dt: float) -> void:
+	match _exp_state:
+		"idle":
+			var orphan := _find_free_mcv()
+			if orphan != null and _age > expand_after:
+				# a crawler already exists (post-load, or bought and forgotten):
+				# adopt it rather than buying another
+				var sites := _pick_expand_site()
+				if not sites.is_empty():
+					_exp_mcv = orphan
+					_exp_site = sites[0]
+					_exp_alts = sites.slice(1)
+					_exp_escort_units = _pick_escort(expand_escort)
+					_exp_state = "driving"
+					_exp_t = EXPAND_DRIVE_TIMEOUT
+				return
+			if not _want_expand():
+				return
+			var sites2 := _pick_expand_site()
+			if sites2.is_empty():
+				_exp_cd = EXPAND_COOLDOWN
+				return
+			if not cur_train.is_empty():
+				return
+			if _start_train(EFBuildings.mcv_for(fac)):
+				_exp_site = sites2[0]
+				_exp_alts = sites2.slice(1)
+				_exp_state = "queued"
+				_exp_t = EXPAND_QUEUE_TIMEOUT
+		"queued":
+			var u := _find_free_mcv()
+			if u != null:
+				_exp_mcv = u
+				_exp_escort_units = _pick_escort(expand_escort)
+				_exp_state = "driving"
+				_exp_t = EXPAND_DRIVE_TIMEOUT
+			elif _exp_t <= 0.0:
+				_exp_fail("no crawler arrived")
+		"driving":
+			if _exp_mcv == null or not is_instance_valid(_exp_mcv) or _exp_mcv.hp <= 0:
+				_exp_fail("crawler lost on the road")
+				return
+			if _exp_t <= 0.0:
+				_exp_fail("crawler never reached the site")
+				return
+			var dest := Vector3((_exp_site.x + 1.5) * EFWorld.T, 0,
+				(_exp_site.y + 1.5) * EFWorld.T)
+			if _exp_pulse <= 0.0:
+				_exp_pulse = 3.0
+				if _exp_mcv.path.is_empty():
+					army.path_single(_exp_mcv, dest, 0)
+				for i in range(_exp_escort_units.size()):
+					var e: EFUnit = _exp_escort_units[i]
+					if is_instance_valid(e) and e.hp > 0 and e.path.is_empty() \
+							and e.tgt_unit == null:
+						army.path_single(e, dest, i + 1)
+			if _exp_mcv.global_position.distance_to(dest) < 4.0:
+				var chk := buildings.can_deploy(_exp_mcv)
+				if bool(chk["ok"]):
+					if buildings.deploy_mcv(_exp_mcv):
+						_exp_anchor = _exp_site + Vector2i(1, 1)
+						_exp_built += 1
+						_exp_state = "building"
+						_exp_mcv = null
+						print("[ai %d] forward base founded at %s" % [fac, _exp_site])
+				elif not _exp_alts.is_empty():
+					_exp_site = _exp_alts.pop_front()   # try the next legal spot
+					_exp_t = maxf(_exp_t, 20.0)
+				else:
+					_exp_fail("site refused: %s" % chk["why"])
+		"building":
+			if _exp_q.is_empty():
+				_exp_state = "idle"
+				_exp_cd = EXPAND_COOLDOWN
+
+
+func _expand_build() -> void:
+	# drain the forward base's own build order, anchored at the new post
+	if _exp_q.is_empty() or _exp_anchor.x < 0 or not cur_build.is_empty():
+		return
+	var id := String(_exp_q[0])
+	if not buildings.prereq_ok(id, fac):
+		_exp_q.pop_front()          # cannot have it here; skip rather than jam
+		return
+	if _start_build(id, _exp_anchor):
+		_exp_q.pop_front()
 
 
 func _enemy_hq_pos() -> Vector3:

@@ -19,11 +19,24 @@ const COL_TEXT := Color(0.81, 0.8, 0.76)
 const COL_DIM := Color(0.5, 0.49, 0.47)
 const COL_ACCENT := Color(0.89, 0.58, 0.23)
 const COL_GOOD := Color(0.55, 0.85, 0.5)
+
+# The sidebar wears the player's colours. These begin as the neutral scheme and
+# are re-mixed from the faction palette in setup() — panels take a whisper of
+# the ARMOUR colour (hull), accents take the TEAM colour, because the panels
+# must stay quiet enough to read while the highlights do the identifying.
+var col_panel := COL_PANEL
+var col_panel_hi := COL_PANEL_HI
+var col_edge := COL_EDGE
+var col_accent := COL_ACCENT
 const COL_BAD := Color(0.9, 0.4, 0.32)
 
 const MM_COLORS := {
 	".": Color(0.38, 0.36, 0.33), ",": Color(0.30, 0.29, 0.26),
 	"#": Color(0.16, 0.16, 0.17), "~": Color(0.17, 0.29, 0.34),
+	# fords read LIGHTER than the channel: the minimap is where a player looks
+	# to find a crossing, so the one thing it must show about a river is where
+	# the army can get over it
+	"f": Color(0.34, 0.48, 0.50),
 	"E": Color(0.93, 0.57, 0.20), "B": Color(0.52, 0.48, 0.42),
 	"R": Color(0.72, 0.6, 0.42), "C": Color(0.62, 0.55, 0.48),
 	"W": Color(0.66, 0.66, 0.7),
@@ -52,6 +65,8 @@ var _survey := []
 var _sel_bld := -1
 signal stance_picked(stance: String)
 signal anthem_pressed()
+signal settings_pressed()
+signal quit_to_menu_pressed()
 
 var demolish_btn: Button
 var stance_a_btn: Button
@@ -72,6 +87,11 @@ var pause_layer: ColorRect
 var announce_label: Label
 var _announce_t := 0.0
 var _sw_was_ready := false
+var hint_panel: Panel
+var hint_label: Label
+var _hint_t := 0.0
+const HINT_TIME := 11.0        # long enough to read two lines AND go do it
+var hints_shown: Array[String] = []    # what the player was actually told, in order
 
 
 class RubberBand extends Control:
@@ -96,6 +116,54 @@ class MiniCamRect extends Control:
 		var c := Vector2(rig.position.x / world_size.x, rig.position.z / world_size.y) * size
 		var half := Vector2(rig.dist * 0.72, rig.dist * 0.52) / world_size * size
 		draw_rect(Rect2(c - half, half * 2.0), Color(1, 1, 1, 0.9), false, 1.0)
+
+
+class MiniBlips extends Control:
+	# Live blips over the minimap terrain. Until now the minimap showed terrain
+	# and start pads only — in a fog-of-war FFA that made it a decoration.
+	# Enemy units appear only while actually visible (u.visible already mirrors
+	# the fog rules), enemy buildings once their ground has been explored.
+	var army: EFArmy
+	var buildings: EFBuildings
+	var world: EFWorld
+	var _t := 0.0
+
+	func _process(dt: float) -> void:
+		_t -= dt
+		if _t <= 0.0:
+			_t = 0.2
+			queue_redraw()
+
+	func _draw() -> void:
+		if army == null or world == null or buildings == null:
+			return
+		var ws := Vector2(world.w * EFWorld.T, world.h * EFWorld.T)
+		for b in buildings.list:
+			if b["hp"] <= 0:
+				continue
+			var bfac: int = int(b["faction"])
+			var o: Vector2i = b["origin"]
+			if bfac != army.player_faction \
+					and not world.is_ally(army.player_faction, bfac) \
+					and not world.is_explored(o.x, o.y):
+				continue
+			var bsz: int = int(EFBuildings.DEFS[b["type"]]["size"])
+			var p := Vector2((float(o.x) + bsz * 0.5) * EFWorld.T / ws.x,
+				(float(o.y) + bsz * 0.5) * EFWorld.T / ws.y) * size
+			var px := 3.0 if b["type"] == "command_post" else 2.0
+			draw_rect(Rect2(p - Vector2(px, px) * 0.5, Vector2(px, px)),
+				EFWorld.FACTIONS[bfac]["color"])
+		for u in army.units:
+			if u.hp <= 0 or u.garrisoned_in >= 0 or u.stowed:
+				continue
+			if u.faction != army.player_faction and not u.visible:
+				continue      # the fog hide loop already decided who is seen
+			var pu := Vector2(u.global_position.x / ws.x,
+				u.global_position.z / ws.y) * size
+			var cu: Color = EFWorld.FACTIONS[u.faction]["color"]
+			if u.faction == army.player_faction:
+				cu = cu.lightened(0.35)   # your own men pop against your color
+			draw_rect(Rect2(pu - Vector2(1, 1), Vector2(2, 2)), cu)
 
 
 class HealthBars extends Control:
@@ -123,9 +191,10 @@ class HealthBars extends Control:
 				continue
 			if not u.selected and u.hp >= u.max_hp and u.shield >= u.max_shield:
 				continue
-			if u.faction != army.player_faction and not army.world.is_explored(
-					int(u.global_position.x / EFWorld.T),
-					int(u.global_position.z / EFWorld.T)):
+			# gate on u.visible, not is_explored: explored-but-fogged ground
+			# hides the enemy's MESH but the old test still drew its bar, so a
+			# wounded hostile in grey fog was a floating health bar over nothing
+			if u.faction != army.player_faction and not u.visible:
 				continue
 			var wp: Vector3 = u.global_position + Vector3(0, u.body_height + 0.6, 0)
 			if cam.is_position_behind(wp):
@@ -160,6 +229,13 @@ func setup(w: EFWorld, r: CameraRig, eco: EFEconomy, bld: EFBuildings) -> void:
 	rig = r
 	economy = eco
 	buildings = bld
+	var thm: Dictionary = EFWorld.FACTIONS.get(bld.player_faction,
+		EFWorld.FACTIONS[1])
+	var thull: Color = thm.get("hull", thm["color"])
+	col_accent = thm["color"]
+	col_panel = COL_PANEL.lerp(thull, 0.10)
+	col_panel_hi = COL_PANEL_HI.lerp(thull, 0.16)
+	col_edge = COL_EDGE.lerp(thm["color"], 0.38)
 	world.tiles_revealed.connect(_on_revealed)
 	mm_scale = maxi(1, int(192.0 / world.w))
 
@@ -179,10 +255,10 @@ func setup(w: EFWorld, r: CameraRig, eco: EFEconomy, bld: EFBuildings) -> void:
 	add_child(hb)
 
 	_rect(Rect2(SB_X, 0, SB_W, 720), COL_BG)
-	_rect(Rect2(SB_X, 0, 2, 720), COL_EDGE)
+	_rect(Rect2(SB_X, 0, 2, 720), col_edge)
 	var x := SB_X + 10
 
-	_label("EMBERFALL: 1940", Vector2(x, 8), 19, COL_ACCENT)
+	_label("EMBERFALL: 1940", Vector2(x, 8), 19, col_accent)
 	_label("PHASE 11 · THE LONG WAR", Vector2(x, 32), 10, COL_DIM)
 
 	# --- minimap ---
@@ -196,6 +272,14 @@ func setup(w: EFWorld, r: CameraRig, eco: EFEconomy, bld: EFBuildings) -> void:
 	minimap_rect.size = mm_size
 	minimap_rect.gui_input.connect(_on_minimap_input)
 	add_child(minimap_rect)
+	var blips := MiniBlips.new()
+	blips.army = r.get_parent().army if r.get_parent().get("army") else null
+	blips.buildings = bld
+	blips.world = w
+	blips.position = minimap_rect.position
+	blips.size = mm_size
+	blips.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(blips)
 	var mc := MiniCamRect.new()
 	mc.rig = rig
 	mc.world_size = Vector2(world.w * EFWorld.T, world.h * EFWorld.T)
@@ -208,7 +292,7 @@ func setup(w: EFWorld, r: CameraRig, eco: EFEconomy, bld: EFBuildings) -> void:
 
 	# --- treasury ---
 	_panel(Rect2(x, y, 200, 52), "TREASURY")
-	credits_label = _label("CREDITS", Vector2(x + 8, y + 17), 13, COL_ACCENT)
+	credits_label = _label("CREDITS", Vector2(x + 8, y + 17), 13, col_accent)
 	power_label = _label("POWER", Vector2(x + 8, y + 33), 13, COL_DIM)
 	y += 60
 
@@ -258,10 +342,10 @@ func setup(w: EFWorld, r: CameraRig, eco: EFEconomy, bld: EFBuildings) -> void:
 			btn.size = Vector2(97, 40)
 			_style_button(btn, 10)
 			btn.pressed.connect(_on_item.bind(tab, id))
-			btn.gui_input.connect(_on_item_rmb.bind(tab, id))
+			btn.gui_input.connect(_on_item_gui_input.bind(tab, id))
 			add_child(btn)
 			var bar := ColorRect.new()
-			bar.color = COL_ACCENT
+			bar.color = col_accent
 			bar.position = btn.position + Vector2(2, 36)
 			bar.size = Vector2(0, 2)
 			bar.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -328,8 +412,8 @@ func setup(w: EFWorld, r: CameraRig, eco: EFEconomy, bld: EFBuildings) -> void:
 	_panel(Rect2(x, y, 200, 70))
 	_label("RMB move·attack·harvest·garrison", Vector2(x + 8, y + 6), 10, COL_DIM)
 	_label("S stop · ESC cancel · F5/F9 save/load", Vector2(x + 8, y + 22), 10, COL_DIM)
-	_label("Z stance · X unfold crawler", Vector2(x + 8, y + 38), 10, COL_DIM)
-	_label("F1 manual · F11 fullscreen", Vector2(x + 8, y + 52), 10, COL_ACCENT)
+	_label("Z stance · X unfold · C escort cam", Vector2(x + 8, y + 38), 10, COL_DIM)
+	_label("F1 manual · F11 fullscreen", Vector2(x + 8, y + 52), 10, col_accent)
 
 	# formation readout, centred under the battlefield while right-click is held
 	_form_label = Label.new()
@@ -337,24 +421,96 @@ func setup(w: EFWorld, r: CameraRig, eco: EFEconomy, bld: EFBuildings) -> void:
 	_form_label.size = Vector2(VIEW_W, 20)
 	_form_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_form_label.add_theme_font_size_override("font_size", 13)
-	_form_label.add_theme_color_override("font_color", COL_ACCENT)
+	_form_label.add_theme_color_override("font_color", col_accent)
 	_form_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_form_label.visible = false
 	add_child(_form_label)
 
+	# The pause overlay is the only way to reach settings mid-battle (AC-10), so
+	# it carries exactly two entries and no more. RESTART MISSION is deliberately
+	# absent — see VERTICAL_SLICE.md; it is out of scope, not forgotten.
 	pause_layer = ColorRect.new()
 	pause_layer.color = Color(0, 0, 0, 0.5)
 	pause_layer.size = Vector2(1280, 720)
 	pause_layer.visible = false
 	add_child(pause_layer)
 	var pl := Label.new()
-	pl.text = "— PAUSED —\n\nP or ESC to resume"
-	pl.position = Vector2(0, 300)
-	pl.size = Vector2(1280, 120)
+	pl.text = "— PAUSED —"
+	pl.position = Vector2(0, 236)
+	pl.size = Vector2(1280, 44)
 	pl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	pl.add_theme_font_size_override("font_size", 30)
-	pl.add_theme_color_override("font_color", COL_ACCENT)
+	pl.add_theme_font_size_override("font_size", 34)
+	pl.add_theme_color_override("font_color", col_accent)
 	pause_layer.add_child(pl)
+	var ph := Label.new()
+	ph.text = "P or ESC to resume"
+	ph.position = Vector2(0, 288)
+	ph.size = Vector2(1280, 20)
+	ph.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	ph.add_theme_font_size_override("font_size", 13)
+	ph.add_theme_color_override("font_color", COL_DIM)
+	pause_layer.add_child(ph)
+
+	var set_btn := Button.new()
+	set_btn.text = "SETTINGS"
+	set_btn.position = Vector2(490, 330)
+	set_btn.size = Vector2(300, 44)
+	_style_button(set_btn, 15)
+	set_btn.pressed.connect(func(): settings_pressed.emit())
+	pause_layer.add_child(set_btn)
+
+	var quit_btn := Button.new()
+	quit_btn.text = "QUIT TO MENU"
+	quit_btn.position = Vector2(490, 386)
+	quit_btn.size = Vector2(300, 44)
+	_style_button(quit_btn, 15)
+	quit_btn.add_theme_color_override("font_color", COL_BAD)
+	quit_btn.pressed.connect(func(): quit_to_menu_pressed.emit())
+	pause_layer.add_child(quit_btn)
+
+	var qn := Label.new()
+	qn.text = "quitting ends this battle · F5 saves, F9 reloads"
+	qn.position = Vector2(0, 440)
+	qn.size = Vector2(1280, 20)
+	qn.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	qn.add_theme_font_size_override("font_size", 11)
+	qn.add_theme_color_override("font_color", COL_DIM)
+	pause_layer.add_child(qn)
+
+	# --- the onboarding banner ---
+	# Deliberately not announce(). That is a single line of combat chatter at the
+	# top of the screen that lasts four seconds, and the two would fight: a goal
+	# completing fires OBJECTIVE COMPLETE and a teaching prompt in the same frame,
+	# and whichever came second would erase the other. A prompt also has to stay
+	# up long enough to be read AND acted on, which is a different job.
+	hint_panel = Panel.new()
+	hint_panel.position = Vector2(150, 540)
+	hint_panel.size = Vector2(760, 84)
+	var hsb := StyleBoxFlat.new()
+	hsb.bg_color = Color(0.07, 0.08, 0.1, 0.94)
+	hsb.border_color = col_accent
+	hsb.set_border_width_all(1)
+	hint_panel.add_theme_stylebox_override("panel", hsb)
+	hint_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hint_panel.visible = false
+	add_child(hint_panel)
+	var hcap := Label.new()
+	hcap.text = "COMMANDER'S NOTE"
+	hcap.position = Vector2(16, 6)
+	hcap.add_theme_font_size_override("font_size", 10)
+	hcap.add_theme_color_override("font_color", col_accent)
+	hcap.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hint_panel.add_child(hcap)
+	hint_label = Label.new()
+	hint_label.position = Vector2(16, 24)
+	hint_label.size = Vector2(728, 52)
+	hint_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	hint_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	hint_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	hint_label.add_theme_font_size_override("font_size", 14)
+	hint_label.add_theme_color_override("font_color", COL_TEXT)
+	hint_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hint_panel.add_child(hint_label)
 
 	fps_label = _label("", Vector2(SB_X + 116, 700), 11, COL_DIM)
 	announce_label = Label.new()
@@ -383,7 +539,7 @@ func _process(_dt: float) -> void:
 			credits_label.add_theme_color_override("font_color", COL_BAD)
 			credits_label.text += "  NO FUNDS"
 		else:
-			credits_label.add_theme_color_override("font_color", COL_ACCENT)
+			credits_label.add_theme_color_override("font_color", col_accent)
 	if buildings:
 		var p := buildings.power_report(buildings.player_faction)
 		power_label.text = "POWER    %d / %d" % [p.y, p.x]
@@ -401,6 +557,11 @@ func _process(_dt: float) -> void:
 		announce_label.modulate.a = clampf(_announce_t / 1.5, 0.0, 1.0)
 		if _announce_t <= 0.0:
 			announce_label.text = ""
+	if _hint_t > 0.0:
+		_hint_t -= get_process_delta_time()
+		hint_panel.modulate.a = clampf(_hint_t / 1.2, 0.0, 1.0)
+		if _hint_t <= 0.0:
+			hint_panel.visible = false
 
 
 func _refresh_build_buttons() -> void:
@@ -429,7 +590,7 @@ func _refresh_build_buttons() -> void:
 					var flash := 0.5 + 0.5 * sin(Time.get_ticks_msec() * 0.008)
 					btn.text = "%s\nPLACE >" % EFBuildings.DEFS[id]["name"]
 					btn.add_theme_color_override("font_color",
-						COL_ACCENT.lerp(Color.WHITE, flash))
+						col_accent.lerp(Color.WHITE, flash))
 				else:
 					btn.text = "%s\n%d%%%s" % [_name_of(id),
 						int(q["paid"] / q["cost"] * 100.0), suffix]
@@ -446,10 +607,7 @@ func _refresh_build_buttons() -> void:
 
 
 func _name_of(id: String) -> String:
-	if id == "doomworks":
-		return buildings.display_name(id, buildings.player_faction)
-	return EFBuildings.DEFS[id]["name"] if EFBuildings.DEFS.has(id) else \
-		EFArmy.KINDS[id]["name"]
+	return buildings.item_name(id)
 
 
 func _refresh_context() -> void:
@@ -465,7 +623,7 @@ func _refresh_context() -> void:
 		repair_btn.text = "REPAIRING..." if buildings.repairing.has(_sel_bld) \
 			and not full else "REPAIR"
 		context_lines[0].text = String(d["name"])
-		context_lines[0].add_theme_color_override("font_color", COL_ACCENT)
+		context_lines[0].add_theme_color_override("font_color", col_accent)
 		context_lines[1].text = "HP %d / %d" % [int(b["hp"]), int(d["hp"])]
 		context_lines[1].add_theme_color_override("font_color", COL_TEXT)
 		var prod: Array = buildings.produces(b["type"])
@@ -490,14 +648,14 @@ func _refresh_context() -> void:
 			i += 1
 		if _harvest_hint:
 			context_lines[3].text = "RMB — harvest this field"
-			context_lines[3].add_theme_color_override("font_color", COL_ACCENT)
+			context_lines[3].add_theme_color_override("font_color", col_accent)
 	elif not _survey.is_empty():
 		context_lines[0].text = str(_survey[0])
 		context_lines[1].text = "tile (%d, %d)" % [_survey[1], _survey[2]]
 		context_lines[1].add_theme_color_override("font_color", COL_DIM)
 		if _survey.size() > 3 and str(_survey[3]) != "":
 			context_lines[2].text = str(_survey[3])
-			context_lines[2].add_theme_color_override("font_color", COL_ACCENT)
+			context_lines[2].add_theme_color_override("font_color", col_accent)
 	else:
 		context_lines[0].text = "--"
 
@@ -570,9 +728,9 @@ func _refresh_stance() -> void:
 		stance_b_btn.add_theme_color_override("font_color", COL_DIM)
 	else:
 		stance_a_btn.add_theme_color_override("font_color",
-			COL_ACCENT if _stance_cur == pick_a else COL_TEXT)
+			col_accent if _stance_cur == pick_a else COL_TEXT)
 		stance_b_btn.add_theme_color_override("font_color",
-			COL_ACCENT if _stance_cur == b else COL_TEXT)
+			col_accent if _stance_cur == b else COL_TEXT)
 
 
 func set_formation_hint(shape: String, n: int) -> void:
@@ -582,7 +740,7 @@ func set_formation_hint(shape: String, n: int) -> void:
 		return
 	_form_label.visible = shape != ""
 	if shape != "":
-		_form_label.text = "%s  ·  %d units  ·  wheel to change · drag to aim" % [shape, n]
+		_form_label.text = "%s  ·  %d units  ·  wheel aims · shift+wheel shape · drag aims" % [shape, n]
 
 
 func set_building(idx: int) -> void:
@@ -602,7 +760,7 @@ func _set_tab(tab: String) -> void:
 			e["bar"].visible = vis
 	for t in _tab_buttons:
 		var tb: Button = _tab_buttons[t]
-		tb.add_theme_color_override("font_color", COL_ACCENT if t == tab else COL_DIM)
+		tb.add_theme_color_override("font_color", col_accent if t == tab else COL_DIM)
 
 
 func show_pause(on: bool) -> void:
@@ -615,10 +773,17 @@ func _on_item(tab: String, id: String) -> void:
 	buildings.click_item(tab, id)
 
 
-func _on_item_rmb(e: InputEvent, tab: String, id: String) -> void:
-	if e is InputEventMouseButton and e.pressed \
-			and e.button_index == MOUSE_BUTTON_RIGHT:
+func _on_item_gui_input(e: InputEvent, tab: String, id: String) -> void:
+	if not (e is InputEventMouseButton and e.pressed):
+		return
+	if e.button_index == MOUSE_BUTTON_RIGHT:
 		buildings.cancel_item(tab, id)
+	elif e.button_index == MOUSE_BUTTON_LEFT and not buildings.prereq_ok(id):
+		# A disabled Button emits no `pressed`, so the click that most needs an
+		# answer is the one _on_item would never hear about. gui_input still
+		# fires, which is the only reason AC-3's prerequisite half is reachable
+		# without un-disabling the buttons and losing what grey already says.
+		buildings.note_denied(id)
 
 
 func _refresh_sw_button() -> void:
@@ -641,7 +806,7 @@ func _refresh_sw_button() -> void:
 			COL_BAD.lerp(Color.WHITE, flash))
 		if not _sw_was_ready:
 			_sw_was_ready = true
-			announce("%s IS READY" % buildings.sw_name(fac), COL_ACCENT)
+			announce("%s IS READY" % buildings.sw_name(fac), col_accent)
 	else:
 		_sw_was_ready = false
 		sw_btn.text = "%s CHARGING  %d%%" % [buildings.sw_name(fac),
@@ -654,6 +819,16 @@ func announce(text: String, col: Color) -> void:
 	announce_label.add_theme_color_override("font_color", col)
 	announce_label.modulate.a = 1.0
 	_announce_t = 4.0
+
+
+func show_hint(text: String) -> void:
+	hint_label.text = text
+	hint_panel.visible = true
+	hint_panel.modulate.a = 1.0
+	_hint_t = HINT_TIME
+	# The record is what --onboard asserts against: it is the list of things the
+	# player was actually shown, not the list of things that were meant to show.
+	hints_shown.append(text)
 
 
 func set_drag_rect(r: Rect2) -> void:
@@ -675,7 +850,7 @@ func show_game_over(win: bool, title_text := "", sub_text := "") -> void:
 	p.size = Vector2(560, 220)
 	var sb := StyleBoxFlat.new()
 	sb.bg_color = Color(0.08, 0.09, 0.11, 0.97)
-	sb.border_color = COL_ACCENT if win else COL_BAD
+	sb.border_color = col_accent if win else COL_BAD
 	sb.set_border_width_all(2)
 	p.add_theme_stylebox_override("panel", sb)
 	add_child(p)
@@ -685,7 +860,7 @@ func show_game_over(win: bool, title_text := "", sub_text := "") -> void:
 	title.size = Vector2(560, 60)
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	title.add_theme_font_size_override("font_size", 42)
-	title.add_theme_color_override("font_color", COL_ACCENT if win else COL_BAD)
+	title.add_theme_color_override("font_color", col_accent if win else COL_BAD)
 	p.add_child(title)
 	var sub := Label.new()
 	if sub_text != "":
@@ -795,13 +970,13 @@ func _build_manual_overlay() -> void:
 	manual_panel.size = Vector2(520, 400)
 	var sb := StyleBoxFlat.new()
 	sb.bg_color = Color(0.08, 0.09, 0.11, 0.96)
-	sb.border_color = COL_ACCENT
+	sb.border_color = col_accent
 	sb.set_border_width_all(2)
 	manual_panel.add_theme_stylebox_override("panel", sb)
 	manual_panel.visible = false
 	add_child(manual_panel)
 	var lines := [
-		["FIELD MANUAL", COL_ACCENT],
+		["FIELD MANUAL", col_accent],
 		["", COL_TEXT],
 		["CAMERA   WASD / arrows / screen edge pan", COL_TEXT],
 		["         Q / E rotate · wheel zoom · minimap jump", COL_TEXT],
@@ -817,6 +992,11 @@ func _build_manual_overlay() -> void:
 		["         buildings: click PLACE, then click the map", COL_TEXT],
 		["         walls keep placing until ESC / RMB", COL_TEXT],
 		["         everything must touch your base (4 tiles)", COL_TEXT],
+		["", COL_TEXT],
+		["CAMERA   C toggles the escort camera: after a move", COL_TEXT],
+		["         order the view trails the group, weighted", COL_TEXT],
+		["         to the fastest. Pan, rotate or click away", COL_TEXT],
+		["         and it hands the camera straight back.", COL_TEXT],
 		["", COL_TEXT],
 		["CRAWLER  drive it somewhere good, then press X", COL_TEXT],
 		["         it unfolds INTO a Command Post — one use", COL_TEXT],
@@ -842,11 +1022,11 @@ func _build_manual_overlay() -> void:
 
 func _style_button(btn: Button, font_size: int) -> void:
 	var sb := StyleBoxFlat.new()
-	sb.bg_color = COL_PANEL
-	sb.border_color = COL_EDGE
+	sb.bg_color = col_panel
+	sb.border_color = col_edge
 	sb.set_border_width_all(1)
 	var sbh := sb.duplicate()
-	sbh.bg_color = COL_PANEL_HI
+	sbh.bg_color = col_panel_hi
 	var sbd := sb.duplicate()
 	sbd.bg_color = Color(0.1, 0.108, 0.124)
 	btn.add_theme_stylebox_override("normal", sb)
@@ -872,8 +1052,8 @@ func _panel(r: Rect2, title: String = "") -> void:
 	p.position = r.position
 	p.size = r.size
 	var sb := StyleBoxFlat.new()
-	sb.bg_color = COL_PANEL
-	sb.border_color = COL_EDGE
+	sb.bg_color = col_panel
+	sb.border_color = col_edge
 	sb.set_border_width_all(1)
 	p.add_theme_stylebox_override("panel", sb)
 	p.mouse_filter = Control.MOUSE_FILTER_IGNORE

@@ -112,6 +112,11 @@ func tab_items(tab: String) -> Array:
 
 signal placed(cells: Array)
 
+# Why the last build-tab click did nothing: {"kind": "prereq"|"cost", "text": ...}.
+# Written by note_denied / _note_if_short, read and cleared by campaign.gd's
+# hints. Empty means the last click was accepted.
+var last_deny := {}
+
 const SW_TIME := 180.0
 const SW_NAMES := {1: "WORLDHAMMER", 2: "THE UNDERMINE", 3: "TEMPEST PROTOCOL",
 	4: "SECOND SUN"}
@@ -286,7 +291,9 @@ func click_item(tab: String, id: String) -> void:
 	if TRAIN.has(id):
 		# units stack: click again to queue more (shown as xN on the button)
 		if not prereq_ok(id):
+			note_denied(id)
 			return
+		_note_if_short(id)
 		if q == null:
 			queues[tab] = _new_item(id)
 		elif backlog[tab].size() < 8:
@@ -297,12 +304,59 @@ func click_item(tab: String, id: String) -> void:
 			pending_place = id                 # READY — arm the placement ghost
 		return
 	if not prereq_ok(id):
+		note_denied(id)
 		return
 	if id == "wall":
 		if economy.credits.get(player_faction, 0) >= DEFS["wall"]["cost"]:
 			pending_place = "wall"             # walls skip the queue entirely
+		else:
+			_note_if_short(id)                 # the one item refused outright
 		return
+	_note_if_short(id)
 	queues[tab] = _new_item(id)
+
+
+# --- why a click did nothing ------------------------------------------------------
+#
+# Every refusal above used to be a bare `return`. That is fine for a player who
+# already knows the tech tree and reads greyed-out buttons; it is a dead end for
+# the one this slice is built for. These two record the reason, and campaign.gd's
+# hint system is what decides whether anyone gets told (AC-3).
+
+func note_denied(id: String) -> void:
+	var need := missing_prereq(id)
+	if need == "":
+		return
+	last_deny = {"kind": "prereq",
+		"text": "%s needs a %s before you can build it."
+			% [item_name(id).to_upper(), need]}
+
+
+func _note_if_short(id: String) -> void:
+	var cost := int(_cost_of(id))
+	var have: int = int(economy.credits.get(player_faction, 0))
+	if have >= cost:
+		return
+	# Walls are paid up front and genuinely refused; everything else drains its
+	# cost out of the treasury as the money arrives, so it starts and crawls.
+	# Those are different outcomes and the player is told which one they got.
+	var tail := " It will start anyway and fill as your harvesters bring it in." \
+		if id != "wall" else " Walls are paid up front, so this one cannot start yet."
+	if audio:
+		audio.announce("no_funds")
+	last_deny = {"kind": "cost",
+		"text": "%s costs $%d and you have $%d.%s"
+			% [item_name(id).to_upper(), cost, have, tail]}
+
+
+# What to call a build-tab entry on screen, buildings and units alike. ui.gd's
+# _name_of was the original and now defers to this: the refusal text and the
+# button label have to say the same word for the player to connect them.
+func item_name(id: String) -> String:
+	if id == "doomworks":
+		return display_name(id, player_faction)
+	return String(DEFS[id]["name"]) if DEFS.has(id) \
+		else String(EFArmy.KINDS[id]["name"])
 
 
 func _new_item(id: String) -> Dictionary:
@@ -331,7 +385,16 @@ func _cost_of(id: String) -> float:
 	return float(TRAIN[id]["cost"] if TRAIN.has(id) else DEFS[id]["cost"])
 
 
+var _was_low_power := false
+
+
 func _process(dt: float) -> void:
+	# the transition INTO deficit is the announcement; the state itself is not,
+	# or the line would repeat every cooldown for as long as the grid sags
+	var lp := low_power(player_faction)
+	if lp and not _was_low_power and audio:
+		audio.announce("low_power")
+	_was_low_power = lp
 	# drain credits into whatever's building, halved when the grid is overdrawn
 	var rate := BUILD_RATE * (LOW_POWER_MULT if low_power(player_faction) else 1.0) * dt
 	for tab in queues:
@@ -348,11 +411,15 @@ func _process(dt: float) -> void:
 		if q["paid"] >= q["cost"] - 0.01:
 			if q["is_unit"]:
 				train_spawn(q["id"], player_faction)
+				if audio:
+					audio.announce("unit_ready")
 				queues[tab] = null
 				if backlog.has(tab) and not backlog[tab].is_empty():
 					queues[tab] = _new_item(backlog[tab].pop_front())
 			else:
 				q["ready"] = true
+				if audio:
+					audio.announce("construction")
 
 	# engineers patch what money allows: 20 hp/s at 1 credit per 2 hp
 	for idx in repairing.keys():
@@ -373,8 +440,10 @@ func _process(dt: float) -> void:
 	# doomworks charge their terrible cargo (stalls during power deficits)
 	for b in list:
 		if b["type"] == "doomworks" and b["hp"] > 0 and not low_power(b["faction"]):
-			sw_charge[b["faction"]] = minf(SW_TIME,
-				sw_charge.get(b["faction"], 0.0) + dt)
+			var swc0: float = sw_charge.get(b["faction"], 0.0)
+			sw_charge[b["faction"]] = minf(SW_TIME, swc0 + dt)
+			if b["faction"] == player_faction and audio and swc0 < SW_TIME 					and sw_charge[b["faction"]] >= SW_TIME:
+				audio.announce("sw_ready", true)
 
 	for k in range(_growing.size() - 1, -1, -1):
 		var g: Dictionary = _growing[k]
@@ -401,6 +470,9 @@ func _process(dt: float) -> void:
 const DEPLOY_SND := {
 	"inf": "dep_infantry", "tank": "dep_vehicle", "smalltank": "dep_vehicle",
 	"scout": "dep_vehicle", "harvester": "dep_harvester", "plane": "dep_air",
+	# the MCVs had no entry and fell through to the generic vehicle sound, so a
+	# mobile base left the factory sounding like a scout car
+	"mcv": "dep_crawler",
 }
 const DEPLOY_SUPER := ["juggernaut", "ashworm", "leviathan", "cathedral"]
 
@@ -419,6 +491,69 @@ func _deploy_sound(id: String, fac: int, cell: Vector2i) -> void:
 	audio.play(snd, Vector3((cell.x + 0.5) * T, 0.6, (cell.y + 0.5) * T), -4.0)
 
 
+# ============================ RALLY POINTS ===================================
+# Right-click with a factory selected plants its rally: everything it trains
+# marches there instead of milling at the door. Stored per building dict (so a
+# second barracks can rally somewhere else), shown as a pennant while selected.
+
+var _rally_node: Node3D = null
+
+
+func is_factory(idx: int) -> bool:
+	if idx < 0 or idx >= list.size():
+		return false
+	var t: String = list[idx]["type"]
+	for k in TRAIN:
+		if TRAIN[k]["from"] == t:
+			return true
+	return false
+
+
+func set_rally(idx: int, pos: Vector3) -> void:
+	if not is_factory(idx):
+		return
+	list[idx]["rally"] = Vector3(pos.x, 0.0, pos.z)
+	show_rally_for(idx)
+
+
+func show_rally_for(idx: int) -> void:
+	# called whenever the selected building changes; -1 hides the pennant
+	if _rally_node == null:
+		_rally_node = Node3D.new()
+		var pole := MeshInstance3D.new()
+		var pm := CylinderMesh.new()
+		pm.top_radius = 0.04
+		pm.bottom_radius = 0.06
+		pm.height = 2.2
+		pm.radial_segments = 6
+		pole.mesh = pm
+		pole.position = Vector3(0, 1.1, 0)
+		pole.material_override = _m(Color(0.2, 0.19, 0.18), 0.7, 0.4)
+		pole.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		_rally_node.add_child(pole)
+		var flag := MeshInstance3D.new()
+		var fm := BoxMesh.new()
+		fm.size = Vector3(0.7, 0.4, 0.05)
+		flag.mesh = fm
+		flag.position = Vector3(0.36, 1.9, 0)
+		var fmat := StandardMaterial3D.new()
+		fmat.albedo_color = Color(1.4, 0.85, 0.3)   # >1.0: catches the glow pass
+		fmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		flag.material_override = fmat
+		flag.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		_rally_node.add_child(flag)
+		add_child(_rally_node)
+	if idx < 0 or idx >= list.size():
+		_rally_node.visible = false
+		return
+	var rp = list[idx].get("rally", null)
+	if rp is Vector3:
+		_rally_node.position = rp
+		_rally_node.visible = true
+	else:
+		_rally_node.visible = false
+
+
 func train_spawn(id: String, fac: int) -> void:
 	# NOTE: the sound fires AFTER a unit actually exists. It used to play up
 	# here, before the early returns below, so a destroyed factory still
@@ -431,16 +566,24 @@ func train_spawn(id: String, fac: int) -> void:
 		var rdoor := Vector2i(rb["origin"].x + 1, rb["origin"].y + 3)
 		var hu := army.spawn(id, fac, rdoor)
 		hu.home_refinery = ridx
+		var rrp = rb.get("rally", null)
+		if rrp is Vector3:
+			# a rallied harvester drives there first, then mines the nearest
+			# field to the rally — so the rally chooses WHICH field it works
+			army.path_single(hu, rrp, 0)
 		_deploy_sound(id, fac, rdoor)
 		return
 	var producer := ""
 	var origin := Vector2i.ZERO
 	var size := 2
-	for b in list:
+	var prod_idx := -1
+	for bi in range(list.size()):
+		var b: Dictionary = list[bi]
 		if b["faction"] == fac and b["type"] == TRAIN[id]["from"] and b["hp"] > 0:
 			origin = b["origin"]
 			size = DEFS[b["type"]]["size"]
 			producer = b["type"]
+			prod_idx = bi
 			break
 	if producer == "":
 		return
@@ -448,7 +591,11 @@ func train_spawn(id: String, fac: int) -> void:
 	if EFArmy.KINDS[id].get("flying", false):
 		door = origin + Vector2i(size / 2, size / 2)
 	var u := army.spawn(id, fac, door)
-	army.path_single(u, Vector3((door.x + 0.5) * T, 0, (door.y + 3.5) * T), 0)
+	var rp = list[prod_idx].get("rally", null)
+	if rp is Vector3:
+		army.path_single(u, rp, 0)
+	else:
+		army.path_single(u, Vector3((door.x + 0.5) * T, 0, (door.y + 3.5) * T), 0)
 	_deploy_sound(id, fac, door)
 
 
@@ -713,6 +860,8 @@ func take_damage(idx: int, wclass: String, dmg: float) -> void:
 	if b["hp"] <= 0:
 		return
 	b["hp"] -= dmg * EFArmy.ARMOR_MULT[wclass]["BLDG"]
+	if b["faction"] == player_faction and audio:
+		audio.announce("base_attack")
 	if music != null:
 		music.bump(0.09)        # shelling a structure counts as a battle too
 	var max_hp: float = DEFS[b["type"]]["hp"]
@@ -799,13 +948,15 @@ func _build_mesh(id: String, faction: int, origin: Vector2i) -> Node3D:
 	var root := Node3D.new()
 	root.position = Vector3((origin.x + size * 0.5) * T, 0, (origin.y + size * 0.5) * T)
 	add_child(root)
+	if id != "wall":
+		_ground_pad(root, size, faction)
 	var glb := "res://models/%s_%s.glb" % [id, String(EFWorld.FACTIONS[faction]["name"]).to_lower()]
 	if not ResourceLoader.exists(glb):
 		glb = "res://models/bld_%s.glb" % id       # shared model, faction-tinted
 	if ResourceLoader.exists(glb):
 		var inst: Node3D = (load(glb) as PackedScene).instantiate()
 		root.add_child(inst)
-		_tint_glb(inst, EFWorld.FACTIONS[faction]["color"], faction)
+		_tint_glb(inst, EFWorld.hull_of(faction), faction)
 		_faction_dressing(root, id, faction, size)
 		var hd := inst.find_child("Head", true, false)
 		if hd is Node3D:
@@ -817,6 +968,18 @@ func _build_mesh(id: String, faction: int, origin: Vector2i) -> Node3D:
 				(hd as Node3D).global_position)
 			(hd as Node3D).reparent(pivot)
 			root.set_meta("head", pivot)
+		elif id == "gun_turret" or id == "aa_turret":
+			# A pipeline turret is ONE Hunyuan mesh, so there is no "Head"
+			# child to find — and army._turrets skipped any turret without a
+			# head, which silently disarmed every turret on the map the day
+			# the new building models landed. Spin the whole tower from a
+			# pivot at barrel height instead: on a 1-tile turret the full-body
+			# traverse reads as the mount slewing onto target.
+			var pivot2 := Node3D.new()
+			root.add_child(pivot2)
+			pivot2.position = Vector3(0, 1.3 if id == "aa_turret" else 1.05, 0)
+			inst.reparent(pivot2)
+			root.set_meta("head", pivot2)
 		return root
 
 	var fac_col: Color = EFWorld.FACTIONS[faction]["color"]
@@ -1074,7 +1237,7 @@ func _plate_mat(faction: int) -> StandardMaterial3D:
 	if not ResourceLoader.exists(diff):
 		_plate_cache[faction] = null
 		return null
-	var col: Color = EFWorld.FACTIONS[faction]["color"]
+	var col: Color = EFWorld.hull_of(faction)
 	var m := StandardMaterial3D.new()
 	# Deliberately NO albedo_texture: albedo_texture multiplies albedo_color, and
 	# these scans are dark, so cladding the walls in one crushed both the
@@ -1151,6 +1314,72 @@ func _spins(mi: MeshInstance3D) -> bool:
 	return false
 
 
+# A slab of poured foundation exactly the size of the tiles the structure
+# occupies. Only the Command Post had one, and without it every other building
+# sat straight on the grass like a dropped prop — the pad is what tells the
+# player how much ground a structure actually claims, which matters when they
+# are fitting a base together. Sized from DEFS.size so it can never disagree
+# with the cells that were actually blocked out.
+func _ground_pad(root: Node3D, size: int, faction: int) -> void:
+	var span := float(size) * T
+	var pad := MeshInstance3D.new()
+	var pm := BoxMesh.new()
+	pm.size = Vector3(span * 0.98, 0.22, span * 0.98)
+	pad.mesh = pm
+	pad.material_override = _pad_mat()
+	pad.position = Vector3(0, 0.05, 0)
+	root.add_child(pad)
+
+	# a faction rim so ownership reads from the ground up, not only from the
+	# building's paint — the same job the Command Post's glowing trim does
+	var rim_mat := _pad_rim_mat(faction)
+	var half := span * 0.5 - 0.06
+	for side in range(4):
+		var rm := BoxMesh.new()
+		var along := span * 0.98
+		rm.size = Vector3(along, 0.09, 0.16) if side < 2 \
+			else Vector3(0.16, 0.09, along)
+		var rim := MeshInstance3D.new()
+		rim.mesh = rm
+		rim.material_override = rim_mat
+		rim.position = Vector3(0, 0.17, half) if side == 0 \
+			else (Vector3(0, 0.17, -half) if side == 1
+				else (Vector3(half, 0.17, 0) if side == 2
+					else Vector3(-half, 0.17, 0)))
+		root.add_child(rim)
+
+
+static var _pad_mat_cache: StandardMaterial3D
+static var _pad_rim_cache := {}
+
+
+func _pad_mat() -> StandardMaterial3D:
+	if _pad_mat_cache == null:
+		_pad_mat_cache = StandardMaterial3D.new()
+		_pad_mat_cache.albedo_color = Color(0.15, 0.145, 0.15)
+		_pad_mat_cache.roughness = 0.95
+		_pad_mat_cache.metallic = 0.0
+	return _pad_mat_cache
+
+
+func _pad_rim_mat(faction: int) -> StandardMaterial3D:
+	if _pad_rim_cache.has(faction):
+		return _pad_rim_cache[faction]
+	var col: Color = EFWorld.FACTIONS.get(faction, EFWorld.FACTIONS[1])["color"]
+	var m := StandardMaterial3D.new()
+	# Painted kerb, not a light strip. At full team colour and 0.55 emission
+	# these glowed hard enough to read as SELECTION boxes — every building on
+	# the field permanently looking selected, which is worse than having no pad
+	# at all. Darkened and dimmed to where it marks ownership without shouting.
+	m.albedo_color = col.darkened(0.32)
+	m.emission_enabled = true
+	m.emission = col
+	m.emission_energy_multiplier = 0.14
+	m.roughness = 0.75
+	_pad_rim_cache[faction] = m
+	return m
+
+
 func _tint_glb(root: Node3D, col: Color, faction := 0) -> void:
 	var plate: StandardMaterial3D = _plate_mat(faction) if faction > 0 else null
 	for child in root.find_children("*", "MeshInstance3D", true, false):
@@ -1161,13 +1390,40 @@ func _tint_glb(root: Node3D, col: Color, faction := 0) -> void:
 			var m := mi.get_active_material(i)
 			if m == null:
 				continue
-			if "tint" in m.resource_name.to_lower():
-				if plate != null:
+			var mname := m.resource_name.to_lower()
+			if mname == "" and i < EFUnit.CUSTOM_SLOT_ROLE.size():
+				# same convention the unit baker relies on: Godot's importer can
+				# drop material names, so role falls back to slot INDEX
+				mname = "u_" + EFUnit.CUSTOM_SLOT_ROLE[i]
+				if i == 0:
+					mname = "unit_tint"
+			# pipeline buildings carry the same four slots as the vehicles, so
+			# the brass/steel trim reads on a refinery exactly as on a tank
+			if mname.begins_with("u_trim"):
+				mi.set_surface_override_material(i, EFUnit._accent_mat(faction))
+				continue
+			if mname.begins_with("u_steel") or mname.begins_with("u_track"):
+				mi.set_surface_override_material(i, EFUnit._gunmetal_mat())
+				continue
+			if "tint" in mname:
+				# The plate material carries its detail in a NORMAL MAP, and a
+				# normal map needs UVs. Hunyuan hulls have none — so a pipeline
+				# building wearing the plate lost the relief AND the baked AO
+				# (the plate never enables vertex_color_use_as_albedo), which is
+				# why the first batch rendered as flat plastic blobs. Units
+				# already solved this: object-space triplanar needs no UVs, and
+				# reads the AO. Route UV-less meshes down the unit path and let
+				# the hand-authored models keep the plate they were built for.
+				var has_uv: bool = (int(mi.mesh.surface_get_format(i))
+					& int(Mesh.ARRAY_FORMAT_TEX_UV)) != 0
+				if plate != null and has_uv:
 					mi.set_surface_override_material(i, plate)
 					continue
 				var dup: Material = m.duplicate()
 				if dup is BaseMaterial3D:
 					(dup as BaseMaterial3D).albedo_color = col.darkened(0.1)
+					if not has_uv and faction > 0:
+						dup = EFUnit._unit_relief(dup as BaseMaterial3D, faction)
 				mi.set_surface_override_material(i, dup)
 			elif relief_on and faction > 0 and m is BaseMaterial3D \
 					and not _spins(mi):

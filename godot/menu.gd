@@ -72,7 +72,41 @@ var map_path: String = MAPS[0][2]
 var sel_mission := 1
 var sel_lore := 0
 const BG_PATH := "res://textures/menu_bg.png"
+const BG_VIDEO_PATH := "res://video/menu_bg.ogv"
 static var _bg_tex: Texture2D = null
+var _bg_layer: CanvasLayer = null
+var _bg_video_ok := false
+
+
+func _ensure_bg() -> void:
+	# Build the animated background ONCE, on a layer beneath the menu's own
+	# (this CanvasLayer sits on the engine default of 1). _clear() only frees
+	# the menu's direct children — the bg layer is one of those, so it is
+	# explicitly skipped there by name.
+	if _bg_layer != null:
+		return
+	if not ResourceLoader.exists(BG_VIDEO_PATH):
+		return
+	var stream := load(BG_VIDEO_PATH) as VideoStream
+	if stream == null:
+		return
+	_bg_layer = CanvasLayer.new()
+	_bg_layer.name = "BGVideoLayer"
+	_bg_layer.layer = 0
+	add_child(_bg_layer)
+	var vp := VideoStreamPlayer.new()
+	vp.stream = stream
+	# anchors, never a one-shot size: the intro taught us the engine resizes
+	# this control to the video's native size when the first frame decodes
+	vp.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	vp.expand = true
+	vp.loop = true                  # ambient loop; nothing awaits `finished`
+	vp.bus = EFSettings.BUS_MUSIC   # muted with the music, as art should be
+	vp.volume_db = -80.0            # the clip is silent, but belt and braces
+	vp.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_bg_layer.add_child(vp)
+	vp.play()
+	_bg_video_ok = true
 var _lore_buttons: Array[Button] = []
 var sel_act := 1
 var _room_missions: Array = []      # global mission ids shown in the current room
@@ -91,6 +125,8 @@ func _ready() -> void:
 
 func _clear() -> void:
 	for c in get_children():
+		if c == _bg_layer:
+			continue        # the animated background survives room changes
 		c.queue_free()
 	_fac_buttons = []
 	_foe_buttons = []
@@ -100,28 +136,41 @@ func _clear() -> void:
 	_start_buttons = []
 	_room_missions = []
 	_lore_buttons = []
-	var bg := ColorRect.new()
-	bg.color = COL_BG
-	bg.size = Vector2(1280, 720)
-	add_child(bg)
-	# _clear() frees every child on each room change, so the background has to be
-	# rebuilt here; only the cached Texture2D survives between rooms.
-	if _bg_tex == null and ResourceLoader.exists(BG_PATH):
-		_bg_tex = load(BG_PATH)
-	if _bg_tex != null:
-		var pic := TextureRect.new()
-		pic.texture = _bg_tex
-		pic.size = Vector2(1280, 720)
-		pic.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-		pic.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_COVERED
-		pic.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		add_child(pic)
-		# a scrim so the panels and text keep their contrast over the art
+	# The ANIMATED background lives on its own layer below the menu precisely so
+	# it is NOT rebuilt per room — recreating a VideoStreamPlayer would restart
+	# the loop on every button press. It must be decided BEFORE the base coat:
+	# the coat is opaque and sits on the higher layer, so painting it over an
+	# active video hides the video completely (observed: pitch-black menu).
+	_ensure_bg()
+	if not _bg_video_ok:
+		var bg := ColorRect.new()
+		bg.color = COL_BG
+		bg.size = Vector2(1280, 720)
+		add_child(bg)
+	if _bg_video_ok:
+		# the video layer is behind us; a scrim keeps the panels readable
 		var scrim := ColorRect.new()
 		scrim.color = Color(0.04, 0.045, 0.055, 0.55)
 		scrim.size = Vector2(1280, 720)
 		scrim.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		add_child(scrim)
+	else:
+		if _bg_tex == null and ResourceLoader.exists(BG_PATH):
+			_bg_tex = load(BG_PATH)
+		if _bg_tex != null:
+			var pic := TextureRect.new()
+			pic.texture = _bg_tex
+			pic.size = Vector2(1280, 720)
+			pic.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+			pic.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_COVERED
+			pic.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			add_child(pic)
+			# a scrim so the panels and text keep their contrast over the art
+			var scrim2 := ColorRect.new()
+			scrim2.color = Color(0.04, 0.045, 0.055, 0.55)
+			scrim2.size = Vector2(1280, 720)
+			scrim2.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			add_child(scrim2)
 	_label("EMBERFALL: 1940", Vector2(0, 30), 40, COL_ACCENT, true)
 	_label("AN ALTERNATE 1940 · THE CRADLE WAR", Vector2(0, 82), 12, COL_DIM, true)
 
@@ -130,7 +179,6 @@ func _clear() -> void:
 
 func _show_root() -> void:
 	_clear()
-	var y := 200
 	var entries := [
 		["CAMPAIGN", "The Cradle War — four acts · twelve missions",
 			func(): _show_campaign()],
@@ -142,17 +190,26 @@ func _show_root() -> void:
 			func(): load_requested.emit()])
 	entries.append(["THE WORLD BIBLE", "the Emberfall, the four powers, the Cradle",
 		func(): _show_lore()])
-	# Four entries is the hard ceiling: they end at y 596, and the footer sits at
-	# 620. A fifth would run to 700 and collide.
+	entries.append(["SETTINGS", "volume · fullscreen · screen size",
+		func(): _show_settings()])
+	# There used to be a hard ceiling of four here, because the row was a fixed
+	# 84 px on a 104 px pitch and a fifth ran to y 700 into the footer at 620.
+	# The block is measured now: five entries (a save on disk plus SETTINGS makes
+	# five) tighten to 66 on 84 and end at 592, and four keep the old geometry
+	# exactly so the front page a stranger sees first has not moved.
+	var n := entries.size()
+	var row_h: int = 84 if n <= 4 else 66
+	var pitch: int = 104 if n <= 4 else 84
+	var y: int = 200 if n <= 4 else 190
 	for e in entries:
 		var b := Button.new()
 		b.position = Vector2(440, y)
-		b.size = Vector2(400, 84)
+		b.size = Vector2(400, row_h)
 		b.text = "%s\n%s" % [e[0], e[1]]
-		_style(b, 17)
+		_style(b, 17 if n <= 4 else 15)
 		b.pressed.connect(e[2])
 		add_child(b)
-		y += 104
+		y += pitch
 	_label("F11 fullscreen · P pauses in battle · F1 field manual",
 		Vector2(0, 620), 11, COL_DIM, true)
 
@@ -376,6 +433,19 @@ func _pick_mode(m: String) -> void:
 				map_path = String(mm[2])
 				break
 	_show_skirmish()
+
+
+# ============================ SETTINGS ============================
+# The room itself is EFSettingsPanel, because the pause overlay shows the very
+# same screen mid-battle (AC-10) and two copies of a volume slider is two
+# chances for them to disagree.
+
+func _show_settings() -> void:
+	_clear()
+	var p := EFSettingsPanel.new()
+	p.scrim_alpha = 0.55        # let the background art through, like every room
+	p.closed.connect(func(): _show_root())
+	add_child(p)
 
 
 # ============================ LORE ============================

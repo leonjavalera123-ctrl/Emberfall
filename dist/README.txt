@@ -1,4 +1,4 @@
-EMBERFALL: 1940                                       build v3.1
+EMBERFALL: 1940                                       build v3.6
 ================================================================
 A steampunk RTS set in an alternate 1940 — four factions fight
 over the Cradle, the largest emberstone field ever found.
@@ -30,15 +30,17 @@ WHAT TO TRY
 
 NEW IN THIS BUILD
 -----------------
-- Infantry now fight as SECTIONS OF SIX. One unit, one health
-  bar, six men — and the section visibly thins as it takes
-  losses, down to a lone survivor. Pull them back to base and
-  they get back up.
-- Enemy commanders start BLIND and go after whoever is nearest
-  once they find them, instead of all piling onto the player.
-- Aircraft and command posts see much further.
-- Heavy units (Juggernaut, Ashworm) no longer wedge themselves
-  in gaps too narrow for their hulls.
+- The MINIMAP shows the war: your forces, allies, and any enemy
+  your side can currently see. Command posts draw bigger.
+- RALLY POINTS: select a factory, right-click the map — a
+  pennant plants there and everything it builds marches to it.
+  Each factory keeps its own rally. Refineries send new
+  harvesters to the field nearest theirs.
+- The enemy fights smarter: its home guard DIGS IN between
+  waves, and on Brutal its cannon vehicles deploy into a gun
+  line at siege range.
+- Tracers finally glow, vehicles lean into turns and braking
+  instead of bouncing, and combat runs faster than ever.
 
 CONTROLS
 --------

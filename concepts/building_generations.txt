@@ -1,0 +1,12 @@
+# Emberfall building concepts — Higgsfield/Artlist Nano Banana 2 (modelId 2251), 130 credits each
+# Generated 2026-08-14. Retrieve with get_generation_status <id>, or list_generations.
+# Style contract: UNPAINTED neutral grey so the faction hull tint reads on top,
+# and a heavily detailed ROOF because that is the surface the 52-degree RTS camera sees.
+boiler          01a0027d-aaaf-7349-b6de-f620ec35543d
+refinery        01a0027d-d904-71b1-a8f2-3e5136cadecc
+barracks        01a0027e-0526-7ff8-bbd3-f8a157a46a5f
+vehicle_works   01a0027e-3a11-7155-b996-3df1a5f70f8c
+airfield        01a0027e-66ef-7b35-87dd-abc4202e5f8e
+gun_turret      01a0027e-a2e2-791a-a5ec-9bd6367db36d
+aa_turret       01a0027e-d1f8-7bde-ab50-96b3e3cb20c0
+doomworks       01a0027f-0471-76b3-b0eb-17fc44f87fa6

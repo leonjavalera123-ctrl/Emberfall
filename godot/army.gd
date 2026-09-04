@@ -335,11 +335,16 @@ func has_selection() -> bool:
 	return not selection.is_empty()
 
 
+signal selection_cleared
+
+
 func clear_selection() -> void:
 	for u in selection:
 		u.selected = false
 	selection.clear()
 	selection_dirty = true
+	# clicking off your troops should also stop the camera trailing them
+	selection_cleared.emit()
 
 
 func click_select(screen_pos: Vector2, additive: bool, cam: Camera3D) -> void:
@@ -557,7 +562,7 @@ func order_smart(point: Vector3, structs: EFStructures,
 				u.tgt_building = enemy_b
 			else:
 				u.tgt_garrison = enemy_g
-		var offs2 := _formation(escorts.size())
+		var offs2 := _formation(escorts.size(), _spread_pitch(escorts))
 		for i in range(escorts.size()):
 			escorts[i].clear_targets()
 			_path_unit(escorts[i], Vector3(point.x + offs2[i].x, 0, point.z + offs2[i].y))
@@ -1094,6 +1099,13 @@ func _separate() -> void:
 			var d := b.global_position - a.global_position
 			d.y = 0.0
 			var min_d := a.radius + b.radius + 0.06
+			if a.role == "inf" and b.role == "inf":
+				# a six-man section visually overflows its collision circle,
+				# so squads packed at vehicle tolerances merged into one
+				# penguin crowd. +0.24 keeps the WORST pair (two 0.36 radius
+				# squads, 1.02 m) under the tightest formation pitch (1.05) —
+				# above it, push-apart fights every formation on arrival.
+				min_d += 0.24
 			var l := d.length()
 			if l < min_d and l > 0.001:
 				var push := d.normalized() * (min_d - l) * 0.5
@@ -1144,6 +1156,8 @@ func ground_point(screen_pos: Vector2, cam: Camera3D) -> Vector3:
 
 func _spawn_marker(point: Vector3) -> void:
 	var ring := TorusMesh.new()
+	ring.rings = 12
+	ring.ring_segments = 8
 	ring.inner_radius = 0.5
 	ring.outer_radius = 0.62
 	var m := StandardMaterial3D.new()
@@ -1407,6 +1421,8 @@ func _make_fort(u: EFUnit) -> void:
 		return
 	var ring := MeshInstance3D.new()
 	var tor := TorusMesh.new()
+	tor.rings = 12
+	tor.ring_segments = 8
 	tor.inner_radius = 0.85
 	tor.outer_radius = 1.35
 	tor.rings = 10
@@ -1508,14 +1524,16 @@ func _turrets(dt: float) -> void:
 	for bi in range(buildings.list.size()):
 		var b: Dictionary = buildings.list[bi]
 		var is_aa: bool = b["type"] == "aa_turret"
-		if (b["type"] != "gun_turret" and not is_aa) or b["hp"] <= 0 or b["head"] == null:
+		# No head clause here: the head is a VISUAL. Gating combat on it is
+		# what turned the building-model swap into every turret going silent.
+		if (b["type"] != "gun_turret" and not is_aa) or b["hp"] <= 0:
 			continue
 		var wpn: Dictionary = AA_TURRET_WEAPON if is_aa else TURRET_WEAPON
 		b["cd"] = maxf(0.0, b.get("cd", 0.0) - dt)
 		if buildings.low_power(b["faction"]):
 			b["tgt"] = null
 			continue
-		var origin: Vector3 = b["head"].global_position
+		var origin: Vector3 = b["head"].global_position if b["head"] != null 			else b["node"].global_position + Vector3(0, 1.2, 0)
 		var tgt: EFUnit = b.get("tgt")
 		var lost: bool = tgt == null or not is_instance_valid(tgt) or tgt.hp <= 0 \
 				or tgt.garrisoned_in >= 0 \
@@ -1539,8 +1557,9 @@ func _turrets(dt: float) -> void:
 		if tgt == null:
 			continue
 		var to: Vector3 = tgt.global_position - origin
-		b["head"].rotation.y = lerp_angle(b["head"].rotation.y,
-			atan2(-to.x, -to.z) - b["node"].rotation.y, 6.0 * dt)
+		if b["head"] != null:
+			b["head"].rotation.y = lerp_angle(b["head"].rotation.y,
+				atan2(-to.x, -to.z) - b["node"].rotation.y, 6.0 * dt)
 		if b["cd"] <= 0.0:
 			b["cd"] = 1.0 / wpn["rof"]
 			var t2: EFUnit = tgt
@@ -1560,6 +1579,18 @@ func _fire(u: EFUnit, origin: Vector3, aim: Vector3, apply: Callable) -> void:
 	if u.cd > 0.0:
 		return
 	u.cd = 1.0 / u.weapon["rof"]
+	if u.is_infantry():
+		u.squad_fire_kick()      # the rifleman's shoulder, done in-shader
+	# the gun kicks the hull: heavy shells rock a vehicle back on its
+	# suspension, small arms barely stir it. Infantry and aircraft skip it.
+	if not u.is_infantry() and not u.flying:
+		match u.weapon["class"]:
+			"CANNON", "BLAST":
+				u.recoil_v = 0.11
+			"ROCKET", "ARC":
+				u.recoil_v = 0.06
+			_:
+				u.recoil_v = maxf(u.recoil_v, 0.025)
 	match u.weapon["class"]:
 		"BULLET":
 			_tracer(origin, aim)
@@ -1631,6 +1662,8 @@ func kill_unit(u: EFUnit, with_wreck: bool) -> void:
 				_puff(u.global_position + spread, Color(0.45, 0.42, 0.4))
 		else:
 			_wreck(u)
+	if u.faction == player_faction and audio:
+		audio.announce("unit_lost")
 	selection.erase(u)
 	selection_dirty = true
 	units.erase(u)
@@ -1666,6 +1699,8 @@ func _wreck(u: EFUnit) -> void:
 
 func _spawn_shell(from: Vector3, to: Vector3, apply: Callable) -> void:
 	var mesh := SphereMesh.new()
+	mesh.radial_segments = 8
+	mesh.rings = 4
 	mesh.radius = 0.1
 	mesh.height = 0.2
 	var m := StandardMaterial3D.new()
@@ -1682,6 +1717,8 @@ func _spawn_shell(from: Vector3, to: Vector3, apply: Callable) -> void:
 
 func _spawn_lob(from: Vector3, to: Vector3, apply: Callable) -> void:
 	var mesh := SphereMesh.new()
+	mesh.radial_segments = 8
+	mesh.rings = 4
 	mesh.radius = 0.13
 	mesh.height = 0.26
 	var m := StandardMaterial3D.new()
@@ -1716,28 +1753,89 @@ func _projectiles_tick(dt: float) -> void:
 
 # --- battle effects --------------------------------------------------------------
 
-func _tracer(from: Vector3, to: Vector3) -> void:
-	var d := to - from
+# Tracers were the hottest allocation in the game: a fresh BoxMesh, material
+# and node per SHOT, for a streak that lives 0.07 s — hundreds a second in a
+# big fight. One MultiMesh ring buffer now draws every tracer on the map in a
+# single call. (The old material also asked an UNSHADED material for emission,
+# which Godot drops — tracers never actually glowed. HDR instance colour does.)
+const TRACER_POOL := 128
+
+var _tracer_mm: MultiMeshInstance3D = null
+var _tracers: Array = []
+var _tracer_next := 0
+
+
+func _ensure_tracer_pool() -> void:
+	if _tracer_mm != null:
+		return
 	var mesh := BoxMesh.new()
-	mesh.size = Vector3(0.045, 0.045, d.length())
+	mesh.size = Vector3(0.045, 0.045, 1.0)   # unit length; scaled per instance
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.use_colors = true
+	mm.mesh = mesh
+	mm.instance_count = TRACER_POOL
+	_tracer_mm = MultiMeshInstance3D.new()
+	_tracer_mm.multimesh = mm
 	var m := StandardMaterial3D.new()
-	m.albedo_color = Color(1.0, 0.9, 0.5)
-	m.emission_enabled = true
-	m.emission = Color(1.0, 0.85, 0.4)
-	m.emission_energy_multiplier = 2.5
 	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	var mi := MeshInstance3D.new()
-	mi.mesh = mesh
-	mi.material_override = m
-	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	add_child(mi)
-	mi.global_position = (from + to) * 0.5
-	mi.look_at(to, Vector3.UP)
-	_fx.append({"kind": "flash", "node": mi, "ttl": 0.07})
+	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	m.vertex_color_use_as_albedo = true
+	_tracer_mm.material_override = m
+	_tracer_mm.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_tracer_mm.custom_aabb = AABB(Vector3.ZERO,
+		Vector3(world.w * T, 40.0, world.h * T))
+	add_child(_tracer_mm)
+	_tracers.resize(TRACER_POOL)
+	for i in range(TRACER_POOL):
+		_tracers[i] = {"live": false, "t": 0.0}
+		mm.set_instance_transform(i, Transform3D(Basis(), Vector3(0, -900, 0)))
+		mm.set_instance_color(i, Color(0, 0, 0, 0))
+
+
+func _tracer(from: Vector3, to: Vector3) -> void:
+	_ensure_tracer_pool()
+	var d := to - from
+	var len := d.length()
+	if len < 0.05:
+		return
+	var dir := d / len
+	# a flak shot can be near-vertical, where UP is a degenerate look basis
+	var up := Vector3.UP if absf(dir.dot(Vector3.UP)) < 0.99 else Vector3.RIGHT
+	var basis := Basis.looking_at(dir, up) * Basis.from_scale(Vector3(1, 1, len))
+	var mm := _tracer_mm.multimesh
+	var i := _tracer_next
+	_tracer_next = (_tracer_next + 1) % TRACER_POOL
+	var s: Dictionary = _tracers[i]
+	s["live"] = true
+	s["t"] = 0.0
+	mm.set_instance_transform(i, Transform3D(basis, (from + to) * 0.5))
+	# > 1.0 goes to the HDR buffer, so the streak finally catches the glow pass
+	mm.set_instance_color(i, Color(2.2, 1.8, 0.85, 0.9))
+
+
+func _tracer_tick(dt: float) -> void:
+	if _tracer_mm == null:
+		return
+	var mm := _tracer_mm.multimesh
+	for i in range(TRACER_POOL):
+		var s: Dictionary = _tracers[i]
+		if not bool(s["live"]):
+			continue
+		s["t"] = float(s["t"]) + dt
+		var f: float = float(s["t"]) / 0.07
+		if f >= 1.0:
+			s["live"] = false
+			mm.set_instance_color(i, Color(0, 0, 0, 0))
+			mm.set_instance_transform(i, Transform3D(Basis(), Vector3(0, -900, 0)))
+			continue
+		mm.set_instance_color(i, Color(2.2, 1.8, 0.85, 0.9 * (1.0 - f)))
 
 
 func _muzzle(at: Vector3, with_light: bool) -> void:
 	var mesh := SphereMesh.new()
+	mesh.radial_segments = 8
+	mesh.rings = 4
 	mesh.radius = 0.22
 	mesh.height = 0.44
 	var m := StandardMaterial3D.new()
@@ -1764,46 +1862,221 @@ func _muzzle(at: Vector3, with_light: bool) -> void:
 		_fx.append({"kind": "flash", "node": l, "ttl": 0.09})
 
 
+# Explosions, pooled like the smoke — and finally glowing. The old per-event
+# material was UNSHADED with emission settings, and unshaded drops emission
+# entirely, so no explosion in this war has ever actually bloomed. An HDR
+# instance colour (values above 1.0) reaches the glow pass for real.
+const BOOM_POOL := 48
+
+var _boom_mm: MultiMeshInstance3D = null
+var _booms: Array = []
+var _boom_next := 0
+
+
+func _ensure_boom_pool() -> void:
+	if _boom_mm != null:
+		return
+	var mesh := SphereMesh.new()
+	mesh.radial_segments = 8
+	mesh.rings = 4
+	mesh.radius = 0.4
+	mesh.height = 0.8
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.use_colors = true
+	mm.mesh = mesh
+	mm.instance_count = BOOM_POOL
+	_boom_mm = MultiMeshInstance3D.new()
+	_boom_mm.multimesh = mm
+	var m := StandardMaterial3D.new()
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	m.vertex_color_use_as_albedo = true
+	_boom_mm.material_override = m
+	_boom_mm.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_boom_mm.custom_aabb = AABB(Vector3.ZERO,
+		Vector3(world.w * T, 40.0, world.h * T))
+	add_child(_boom_mm)
+	_booms.resize(BOOM_POOL)
+	for i in range(BOOM_POOL):
+		_booms[i] = {"live": false, "t": 0.0, "pos": Vector3.ZERO}
+		mm.set_instance_transform(i, Transform3D(Basis(), Vector3(0, -900, 0)))
+		mm.set_instance_color(i, Color(0, 0, 0, 0))
+
+
 func _boom(at: Vector3) -> void:
 	if audio:
 		audio.play("expl_small", at, -6.0)
+	_ensure_boom_pool()
+	var s: Dictionary = _booms[_boom_next]
+	s["live"] = true
+	s["t"] = 0.0
+	s["pos"] = at
+	_boom_next = (_boom_next + 1) % BOOM_POOL
+
+
+func _boom_tick(dt: float) -> void:
+	if _boom_mm == null:
+		return
+	var mm := _boom_mm.multimesh
+	for i in range(BOOM_POOL):
+		var s: Dictionary = _booms[i]
+		if not bool(s["live"]):
+			continue
+		s["t"] = float(s["t"]) + dt
+		var f: float = float(s["t"]) / 0.55
+		if f >= 1.0:
+			s["live"] = false
+			mm.set_instance_color(i, Color(0, 0, 0, 0))
+			mm.set_instance_transform(i, Transform3D(Basis(), Vector3(0, -900, 0)))
+			continue
+		var sc := 1.0 + f * 2.6
+		mm.set_instance_transform(i,
+			Transform3D(Basis().scaled(Vector3(sc, sc, sc)), s["pos"]))
+		# hot white-orange core cooling to ember as it swells and thins
+		mm.set_instance_color(i, Color(3.0 - f * 1.6, 1.5 - f * 0.9,
+			0.45 - f * 0.25, 0.85 * (1.0 - f)))
+
+
+# Every puff used to allocate its own SphereMesh, its own StandardMaterial3D and
+# its own MeshInstance3D — around 90 allocations a second in a busy fight, each
+# one its own draw call. They now all live in a single MultiMesh ring buffer:
+# one draw call for every puff of smoke on the map, and nothing allocated after
+# the pool is built.
+const PUFF_POOL := 256
+
+var _puff_mm: MultiMeshInstance3D = null
+var _puffs: Array = []          # ring slots: {t, life, pos, size, col, live}
+var _puff_next := 0
+
+
+func _ensure_puff_pool() -> void:
+	if _puff_mm != null:
+		return
 	var mesh := SphereMesh.new()
-	mesh.radius = 0.4
-	mesh.height = 0.8
+	mesh.radial_segments = 8
+	mesh.rings = 4
+	mesh.radius = 0.5
+	mesh.height = 1.0
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.use_colors = true            # per-puff colour AND fade ride the instance
+	mm.mesh = mesh
+	mm.instance_count = PUFF_POOL
+	_puff_mm = MultiMeshInstance3D.new()
+	_puff_mm.multimesh = mm
 	var m := StandardMaterial3D.new()
-	m.albedo_color = Color(1.0, 0.6, 0.2, 0.85)
+	m.albedo_color = Color(1, 1, 1, 1)
 	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	m.emission_enabled = true
-	m.emission = Color(1.0, 0.5, 0.15)
-	m.emission_energy_multiplier = 2.5
 	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	var mi := MeshInstance3D.new()
-	mi.mesh = mesh
-	mi.material_override = m
-	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	mi.position = at
-	add_child(mi)
-	_fx.append({"kind": "boom", "node": mi, "mat": m, "ttl": 0.3, "max": 0.3})
+	m.vertex_color_use_as_albedo = true   # without this the instance colour is ignored
+	_puff_mm.material_override = m
+	_puff_mm.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# the pool spans the whole map, so never let Godot recompute it per frame
+	_puff_mm.custom_aabb = AABB(Vector3.ZERO,
+		Vector3(world.w * T, 40.0, world.h * T))
+	add_child(_puff_mm)
+	_puffs.resize(PUFF_POOL)
+	for i in range(PUFF_POOL):
+		_puffs[i] = {"live": false, "t": 0.0, "life": 0.9, "pos": Vector3.ZERO,
+			"size": 1.0, "col": Color.WHITE}
+		# park unused slots far below the map rather than at the origin
+		mm.set_instance_transform(i, Transform3D(Basis(), Vector3(0, -900, 0)))
+		mm.set_instance_color(i, Color(1, 1, 1, 0))
 
 
 func _puff(at: Vector3, col: Color, size := 1.0) -> void:
-	var mesh := SphereMesh.new()
-	mesh.radius = 0.5 * size
-	mesh.height = 1.0 * size
-	var m := StandardMaterial3D.new()
-	m.albedo_color = Color(col.r, col.g, col.b, 0.5)
-	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	var mi := MeshInstance3D.new()
-	mi.mesh = mesh
-	mi.material_override = m
-	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	mi.position = at
-	add_child(mi)
-	_fx.append({"kind": "puff", "node": mi, "mat": m, "ttl": 0.9, "max": 0.9})
+	_ensure_puff_pool()
+	var slot: Dictionary = _puffs[_puff_next]
+	slot["live"] = true
+	slot["t"] = 0.0
+	slot["life"] = 0.9
+	slot["pos"] = at
+	slot["size"] = size
+	slot["col"] = col
+	_puff_next = (_puff_next + 1) % PUFF_POOL
+
+
+func _puff_tick(dt: float) -> void:
+	if _puff_mm == null:
+		return
+	var mm := _puff_mm.multimesh
+	for i in range(PUFF_POOL):
+		var s: Dictionary = _puffs[i]
+		if not bool(s["live"]):
+			continue
+		s["t"] = float(s["t"]) + dt
+		var f: float = float(s["t"]) / float(s["life"])
+		if f >= 1.0:
+			s["live"] = false
+			mm.set_instance_color(i, Color(1, 1, 1, 0))
+			mm.set_instance_transform(i, Transform3D(Basis(), Vector3(0, -900, 0)))
+			continue
+		var p: Vector3 = s["pos"]
+		p.y += float(s["t"]) * 1.1            # smoke rises
+		var sc: float = float(s["size"]) * (1.0 + f * 1.4)
+		mm.set_instance_transform(i,
+			Transform3D(Basis().scaled(Vector3(sc, sc, sc)), p))
+		var c: Color = s["col"]
+		mm.set_instance_color(i, Color(c.r, c.g, c.b, 0.5 * (1.0 - f)))
+
+
+var _wound_t := 0.0
+var _wound_i := 0
+
+
+func _wound_smoke_tick(dt: float) -> void:
+	# Wounded machines SHOW it: below ~55% hp a vehicle trails dark smoke,
+	# badly hurt ones spit ember sparks; damaged buildings smoulder from the
+	# roof. All of it rides the existing puff pool — zero allocations.
+	_wound_t -= dt
+	if _wound_t > 0.0:
+		return
+	_wound_t = 0.35
+	_wound_i += 1
+	var emitted := 0
+	for k in range(units.size()):
+		if emitted >= 6:
+			break
+		if (k + _wound_i) % 3 != 0:
+			continue                    # stagger so smokers take turns
+		var u := units[k]
+		if u.hp <= 0 or u.is_infantry() or u.garrisoned_in >= 0 or u.stowed:
+			continue
+		var frac := u.hp / maxf(u.max_hp, 1.0)
+		if frac >= 0.55:
+			continue
+		var at := u.global_position + Vector3(randf_range(-0.3, 0.3),
+			0.9 if not u.flying else 0.2, randf_range(-0.3, 0.3))
+		if frac < 0.28:
+			_puff(at, Color(1.0, 0.45, 0.15), 0.5)   # sparks in the smoke
+		_puff(at, Color(0.13, 0.12, 0.11), 0.7 + (0.55 - frac))
+		emitted += 1
+	for b in buildings.list:
+		if emitted >= 9:
+			break
+		var bh: float = b["hp"]
+		if bh <= 0:
+			continue
+		var bmax: float = float(EFBuildings.DEFS[b["type"]]["hp"])
+		if bh / bmax >= 0.6:
+			continue
+		var o: Vector2i = b["origin"]
+		var sz: int = int(EFBuildings.DEFS[b["type"]]["size"])
+		if (o.x + o.y + _wound_i) % 2 != 0:
+			continue
+		_puff(Vector3((o.x + sz * 0.5) * T + randf_range(-0.8, 0.8),
+			1.6 + sz * 0.5,
+			(o.y + sz * 0.5) * T + randf_range(-0.8, 0.8)),
+			Color(0.1, 0.09, 0.09), 1.0)
+		emitted += 1
 
 
 func _fx_tick(dt: float) -> void:
+	_puff_tick(dt)
+	_tracer_tick(dt)
+	_boom_tick(dt)
+	_wound_smoke_tick(dt)
 	for k in range(_fx.size() - 1, -1, -1):
 		var e: Dictionary = _fx[k]
 		e["ttl"] -= dt
@@ -1816,11 +2089,6 @@ func _fx_tick(dt: float) -> void:
 				var f: float = 1.0 - e["ttl"] / e["max"]
 				e["node"].scale = Vector3.ONE * (1.0 + f * 2.6)
 				e["mat"].albedo_color.a = 0.85 * (1.0 - f)
-			"puff":
-				var f2: float = 1.0 - e["ttl"] / e["max"]
-				e["node"].position.y += dt * 1.1
-				e["node"].scale = Vector3.ONE * (1.0 + f2 * 1.4)
-				e["mat"].albedo_color.a = 0.5 * (1.0 - f2)
 			"crash":
 				e["vel"] += Vector3(0, -14.0, 0) * dt
 				var cn: Node3D = e["node"]
@@ -1922,6 +2190,8 @@ func _arc_bolt(from: Vector3, to: Vector3) -> void:
 
 func _shield_blip(at: Vector3) -> void:
 	var mesh := SphereMesh.new()
+	mesh.radial_segments = 8
+	mesh.rings = 4
 	mesh.radius = 0.5
 	mesh.height = 1.0
 	var m := StandardMaterial3D.new()
@@ -1946,6 +2216,8 @@ func _flak(from: Vector3, to: Vector3) -> void:
 
 func _spawn_rocket(from: Vector3, to: Vector3, apply: Callable) -> void:
 	var mesh := CapsuleMesh.new()
+	mesh.radial_segments = 8
+	mesh.rings = 3
 	mesh.radius = 0.07
 	mesh.height = 0.5
 	var m := StandardMaterial3D.new()
@@ -2156,6 +2428,8 @@ func _wrecks_tick(dt: float) -> void:
 func superweapon_strike(fac: int, pos: Vector3) -> void:
 	superweapon_launched.emit(fac, pos)
 	var ring := TorusMesh.new()
+	ring.rings = 12
+	ring.ring_segments = 8
 	ring.inner_radius = 8.4
 	ring.outer_radius = 9.0
 	var m := StandardMaterial3D.new()
@@ -2172,6 +2446,7 @@ func superweapon_strike(fac: int, pos: Vector3) -> void:
 	add_child(mi)
 	if audio:
 		audio.play_ui("sw_klaxon", -2.0)
+		audio.announce("sw_launch", true)
 	_sw_strikes.append({"pos": pos, "t": 4.0, "ring": mi, "mat": m})
 
 

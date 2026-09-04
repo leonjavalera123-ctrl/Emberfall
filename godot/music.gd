@@ -13,7 +13,13 @@
 #
 # This node is deliberately NOT in main's PROCESS_MODE_PAUSABLE list — the score
 # keeps playing over the pause overlay (ducked), the way a war does not stop
-# being a war because you looked away.
+# being a war because you looked away. The settings screen is reachable from
+# that overlay, so this is also what keeps the score running while the player
+# drags the Music fader and listens to what it does.
+#
+# Every player here runs on the Music bus. The volume_db ride below — the combat
+# swell, the pause duck, the anthem duck — is the MIX. The bus is the player's
+# fader underneath it. Neither knows about the other.
 
 class_name EFMusic
 extends Node
@@ -86,6 +92,7 @@ func _make(track: String, vol_db: float) -> AudioStreamPlayer:
 	var p := AudioStreamPlayer.new()
 	p.stream = stream
 	p.volume_db = vol_db
+	p.bus = EFSettings.BUS_MUSIC
 	add_child(p)
 	return p
 
@@ -145,6 +152,7 @@ func _load_anthem(fac: int) -> bool:
 		(stream as AudioStreamWAV).loop_mode = AudioStreamWAV.LOOP_DISABLED
 	if anthem == null:
 		anthem = AudioStreamPlayer.new()
+		anthem.bus = EFSettings.BUS_MUSIC
 		add_child(anthem)
 		anthem.finished.connect(_on_anthem_finished)
 	anthem.stream = stream

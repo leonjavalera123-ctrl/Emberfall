@@ -76,6 +76,25 @@ const MISSIONS := {
 			{"type": "kill_hq"},
 		],
 		"ai_tech_limit": "infantry",
+		# The teaching curriculum. These exist on M1 and nowhere else, which is
+		# what makes "only in M1" a fact about the data rather than a rule some
+		# future mission has to remember not to break.
+		"hints": [
+			{"trigger": "start",
+				"text": "OBJECTIVE: raise a Boiler House, then a Barracks. The build tabs are on the right — click BASE, click an item to start it, then click PLACE and click the ground."},
+			{"trigger": "no_move", "t": 20.0,
+				"text": "Left-click a soldier to select him, or drag a box across several. Right-click the ground to send them there."},
+			{"trigger": "deny", "kind": "prereq",
+				"text": "%s  ·  Anything greyed out in the tabs is already telling you what it still needs."},
+			{"trigger": "deny", "kind": "cost",
+				"text": "%s  ·  Credits come from harvesters working the orange ember fields."},
+			{"trigger": "goal", "n": 0,
+				"text": "Your foundation stands. The Barracks trains infantry — they are under the INF tab."},
+			{"trigger": "goal", "n": 1,
+				"text": "Eight Iron Guard under arms. Drag a box across them, then right-click the enemy camp."},
+			{"trigger": "low_power",
+				"text": "LOW POWER — your grid draws more than it makes. Turrets hold their fire until you raise another Boiler House."},
+		],
 	},
 	2: {
 		"act": 1,
@@ -414,6 +433,11 @@ var _waves: Array = []
 var _drive_t := 0.0
 var debug_fast := false
 
+const HINT_GAP := 6.0     # a prompt gets this long to itself before another may fire
+var _hints: Array = []    # this mission's prompt records; empty for 2-12
+var _hints_fired := {}    # index into _hints -> already shown
+var _hint_gap := 0.0
+
 
 # --- progression ------------------------------------------------------------------
 
@@ -465,7 +489,10 @@ func begin(mid: int, m: Node) -> void:
 	mission = mid
 	active = true
 	mission_t = 0.0
+	_hints_fired = {}
+	_hint_gap = 0.0
 	var cfg: Dictionary = MISSIONS[mid]
+	_hints = cfg.get("hints", [])
 	var goals: Array = cfg["goals"]
 	obj_done = []
 	for _g in goals:
@@ -607,10 +634,81 @@ func tick(dt: float) -> String:
 			"survive":
 				_check(i, survive_left <= 0.0)
 
+	# After the goals, so a goal-completion prompt sees the tick that completed it
+	_tick_hints(dt)
+
 	if timed:
 		_push_objectives()
 		if survive_left <= 0.0:
 			return "win"
+	return ""
+
+
+# --- onboarding prompts (AC-1..AC-6) ----------------------------------------------
+#
+# Hints are DATA, on exactly the same terms as prebuild / grant / veterans: a
+# mission that wants to teach something adds a record and no engine code moves.
+#
+# That is also the whole of AC-6 and AC-14. "Prompts fire only in M1" and "no
+# prompts in missions 2-12" are not rules anything has to enforce at runtime —
+# missions 2-12 have no `hints` key, so there is nothing there to suppress.
+
+func _tick_hints(dt: float) -> void:
+	# First and cheapest: eleven of the twelve missions leave here immediately,
+	# and this runs every frame of every one of them.
+	if _hints.is_empty():
+		return
+	_hint_gap = maxf(0.0, _hint_gap - dt)
+	if _hint_gap > 0.0:
+		return
+	for i in range(_hints.size()):
+		var h: Dictionary = _hints[i]
+		if _hints_fired.has(i) and bool(h.get("once", true)):
+			continue
+		var text := _hint_text(h)
+		if text == "":
+			continue
+		_hints_fired[i] = true
+		_hint_gap = HINT_GAP
+		main.ui.show_hint(text)
+		if main.audio:
+			main.audio.play_ui("ready_chime", -12.0)
+		return          # one at a time; whatever else is ready keeps until next tick
+
+
+# Returns the finished prompt, or "" for "not yet". Empty is a safe sentinel
+# because a prompt with nothing to say is not a prompt.
+func _hint_text(h: Dictionary) -> String:
+	var body := String(h.get("text", ""))
+	match String(h["trigger"]):
+		"start":
+			# a beat late, so the mission title has the screen to itself first
+			return body if mission_t >= 1.5 else ""
+		"no_move":
+			if main.player_ordered or mission_t < float(h.get("t", 20.0)):
+				return ""
+			return body
+		"deny":
+			# AC-3's "specific reason" is built where the refusal happened and
+			# names the actual item and the actual shortfall; the mission data
+			# supplies only the lesson wrapped around it.
+			var d: Dictionary = main.buildings.last_deny
+			if d.is_empty() or String(d.get("kind", "")) != String(h.get("kind", "")):
+				return ""
+			main.buildings.last_deny = {}
+			return body % String(d.get("text", ""))
+		"goal":
+			var n: int = int(h.get("n", 0))
+			if n >= obj_done.size() or not obj_done[n]:
+				return ""
+			# AC-4's second half. The next objective is READ from the mission's
+			# own list rather than copied into the hint, so the two cannot drift.
+			var objs: Array = MISSIONS[mission]["objectives"]
+			if n + 1 < objs.size():
+				return "%s  ·  NEXT: %s" % [body, String(objs[n + 1])]
+			return body
+		"low_power":
+			return body if main.buildings.low_power(main.player_fac) else ""
 	return ""
 
 

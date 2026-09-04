@@ -8,6 +8,15 @@
 #   ... -- --selftest shot.png --econ | --build | --war
 #   ... -- --selftest shot.png --ai        (watch the enemy commander think)
 #   ... -- --selftest shot.png --gameover  (prove the defeat path)
+#
+# The vertical slice (VERTICAL_SLICE.md) adds five, all of which quit on their
+# own and none of which need the --selftest harness:
+#   ... -- --onboard              M1's teaching prompts, in order, once each
+#   ... -- --onboard-off N        the same triggers on mission N: silence
+#   ... -- --settings             volumes/fullscreen/resolution round-trip
+#   ... -- --busvol               a zeroed fader is -inf AT THE BUS
+#   ... -- --settingsshot out.png [--in-game]  how the screen actually looks
+#   ... -- --intro out.png        the studio logo plays, advances, and skips
 
 extends Node3D
 
@@ -29,6 +38,15 @@ var audio: EFAudio
 var music: EFMusic
 var campaign: EFCampaign
 var menu: EFMenu
+var intro: EFIntro
+
+# The studio logo plays ONCE per process. _quit_to_menu(), and the F9 and R
+# branches of _unhandled_input(), all call reload_current_scene(), which destroys
+# this node and re-runs _ready() from the top with identical argv — an instance
+# var would reset with it and the logo would replay on every death. A static
+# survives the reload; that statics do is the whole reason EFUnit.reset_visual_
+# caches() has to be called by hand up in _ready().
+static var _intro_played := false
 
 var player_fac := 1
 var ai_fac := 2                 # primary enemy (campaign / selftest alias)
@@ -66,6 +84,12 @@ var _rmb_pos := Vector2.ZERO
 var _rmb_preview := false
 var _shape_i := 0                       # index into EFArmy.SHAPES
 var _ghost_pool: Array[MeshInstance3D] = []
+var _face_ghost: MeshInstance3D = null  # arrow showing which way the line faces
+var _form_rot := -1.0                   # wheel-aimed facing in radians; <0 = auto
+var _settings_panel: EFSettingsPanel = null   # non-null while it is up mid-battle
+# Has the player ever right-clicked an order to anyone? AC-2's prompt teaches
+# exactly that gesture, so having used it once is proof the lesson is not needed.
+var player_ordered := false
 
 
 func _ready() -> void:
@@ -73,6 +97,17 @@ func _ready() -> void:
 	# below are explicitly pausable
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	EFUnit.reset_visual_caches()      # material ids are not stable across reloads
+
+	# AC-9: the player's settings are back in force before anything can be heard.
+	# Audio always — the buses exist whatever we booted for. The WINDOW only on a
+	# real launch: a dev flag inheriting somebody's 2560x1440 fullscreen would
+	# report an FPS number that cannot be compared with the baseline, and would
+	# save its screenshot from a viewport nobody asked for.
+	EFSettings.load_settings()
+	EFSettings.apply_audio()
+	if OS.get_cmdline_user_args().is_empty():
+		EFSettings.apply_video()
+
 	_setup_sky_and_light()
 
 	# The score lives here, on main, and is deliberately left out of the
@@ -81,6 +116,132 @@ func _ready() -> void:
 	add_child(music)
 
 	var uargs := OS.get_cmdline_user_args()
+	if uargs.has("--settingsshot"):
+		# The settings screen has two hosts and they must look like one screen.
+		# Pass --in-game to shoot the one that opens over a paused battle.
+		var spath := "user://settings.png"
+		var sshot := uargs.find("--settingsshot")
+		if sshot + 1 < uargs.size() and not uargs[sshot + 1].begins_with("--"):
+			spath = uargs[sshot + 1]
+		if uargs.has("--in-game"):
+			_on_campaign_start(1)
+			for i in range(30):
+				await get_tree().process_frame
+			_toggle_pause()
+			# The overlay is the other half of AC-10. It is the door; shoot it
+			# before walking through, or the picture only proves the room exists
+			# and says nothing about whether anyone can find it.
+			for i in range(10):
+				await get_tree().process_frame
+			await RenderingServer.frame_post_draw
+			var ppath := spath.get_basename() + "_pause.png"
+			get_viewport().get_texture().get_image().save_png(ppath)
+			print("pause overlay screenshot -> %s" % ppath)
+			_open_settings()
+		else:
+			menu = EFMenu.new()
+			add_child(menu)
+			menu._show_settings()
+		for i in range(20):
+			await get_tree().process_frame
+		await RenderingServer.frame_post_draw
+		get_viewport().get_texture().get_image().save_png(spath)
+		print("settings screenshot -> %s (in_game=%s)" % [spath, uargs.has("--in-game")])
+		get_tree().quit()
+		return
+	if uargs.has("--intro"):
+		# Four claims, because three of them can pass while the logo is broken:
+		# the stream loads and plays; it ADVANCES (a decoder frozen on frame zero
+		# still reports is_playing); it is actually ON SCREEN (a black frame would
+		# satisfy everything above); and a keypress through the real handler
+		# kills it. Engine.time_scale stays 1.0 throughout — _wait_seconds counts
+		# scaled delta but Theora decode does not ride that clock, so every
+		# measurement below is wall-clock.
+		var ipath := "user://intro.png"
+		var ii := uargs.find("--intro")
+		if ii + 1 < uargs.size() and not uargs[ii + 1].begins_with("--"):
+			ipath = uargs[ii + 1]
+		var iv := EFIntro.new()
+		add_child(iv)
+		# Grace window first: an event landing in the opening milliseconds — the
+		# Enter that launched the game from a shortcut — must NOT eat the logo.
+		var early := InputEventKey.new()
+		early.keycode = KEY_ESCAPE
+		early.pressed = true
+		iv._input(early)
+		var grace_held := not iv.is_done
+		print("intro: keypress inside the %d ms grace — survived=%s (must be true)"
+			% [EFIntro.INPUT_GRACE_MS, grace_held])
+		await _wait_seconds(0.5)
+		if iv.player == null:
+			print("intro: VERDICT FAIL — nothing loaded from %s" % EFIntro.VIDEO_PATH)
+			get_tree().quit()
+			return
+		var vp: VideoStreamPlayer = iv.player
+		print("intro: load=%d ms length=%.2f s playing=%s bus=%s (playing must be true, bus must be Music)"
+			% [iv.load_ms, vp.get_stream_length(), vp.is_playing(), vp.bus])
+		var w0 := Time.get_ticks_msec()
+		var p0 := vp.stream_position
+		await _wait_seconds(1.0)
+		var wall := Time.get_ticks_msec() - w0
+		var p1 := vp.stream_position
+		var advanced := p1 > p0
+		print("intro: stream_position %.2f -> %.2f over %d ms wall — ratio %.2f (must rise; ratio near 1.00 means the decoder keeps up)"
+			% [p0, p1, wall, (p1 - p0) / maxf(wall / 1000.0, 0.001)])
+		for i in range(10):
+			await get_tree().process_frame
+		await RenderingServer.frame_post_draw
+		var img := get_viewport().get_texture().get_image()
+		img.save_png(ipath)
+		var luma := 0.0
+		for y in range(0, img.get_height(), 16):
+			for x in range(0, img.get_width(), 16):
+				luma = maxf(luma, img.get_pixel(x, y).get_luminance())
+		var lit := luma > 0.05
+		print("intro screenshot -> %s  max_luma=%.3f (must exceed 0.05 — a black PNG proves nothing)"
+			% [ipath, luma])
+		# The hold contract: input through the REAL handler must be ignored
+		# before SHOW_MIN_MS — the wordmark lands late and the studio name must
+		# always be seen — and after the hold a keypress starts the FADE, never
+		# a hard cut.
+		var esc := InputEventKey.new()
+		esc.keycode = KEY_ESCAPE
+		esc.pressed = true
+		iv._input(esc)
+		await _wait_seconds(0.3)
+		var held_early := vp.is_playing() and not iv.fading and not iv.is_done
+		print("intro: ESC at ~2s — still playing=%s fading=%s (must be true / false: the 14 s hold)"
+			% [vp.is_playing(), iv.fading])
+		# wait out the hold, then the same key must begin the fade
+		var hold_end: int = iv._t0 + EFIntro.SHOW_MIN_MS
+		await _wait_until(func(): return Time.get_ticks_msec() >= hold_end, 16.0)
+		var esc2 := InputEventKey.new()
+		esc2.keycode = KEY_ESCAPE
+		esc2.pressed = true
+		iv._input(esc2)
+		await _wait_seconds(0.2)
+		var fade_began := iv.fading and not iv.is_done
+		var veil_rising := iv._fade_rect != null and iv._fade_rect.color.a > 0.0
+		print("intro: ESC after the hold — fading=%s veil alpha=%.2f (fade must be underway, not a cut)"
+			% [iv.fading, iv._fade_rect.color.a if iv._fade_rect != null else -1.0])
+		var t_done := Time.get_ticks_msec()
+		if not iv.is_done:
+			await iv.done
+		var fade_took := (Time.get_ticks_msec() - t_done) / 1000.0
+		var shown_s := (Time.get_ticks_msec() - iv._t0) / 1000.0
+		print("intro: done after %.1f s on screen, fade ran %.2f s (shown must be >= 14, fade ~%.1f)"
+			% [shown_s, fade_took, EFIntro.FADE_S])
+		var held_14 := shown_s >= 14.0
+		iv.queue_free()
+		await get_tree().process_frame
+		var gone := not is_instance_valid(iv)
+		print("intro: overlay freed=%s (must be true)" % [gone])
+		print("intro: VERDICT %s"
+			% ["PASS" if grace_held and advanced and lit and held_early
+				and fade_began and veil_rising and held_14 and gone
+				else "FAIL"])
+		get_tree().quit()
+		return
 	if uargs.has("--menushot"):
 		menu = EFMenu.new()
 		add_child(menu)
@@ -161,6 +322,228 @@ func _ready() -> void:
 		get_tree().quit()
 		return
 
+	if uargs.has("--busvol"):
+		# AC-11: prove silence at the MIXER. A slider that reads 0% while the bus
+		# sits at 0 dB is exactly the bug this flag exists to catch, so nothing
+		# here reads a UI value.
+		var probe := EFAudio.new()
+		add_child(probe)
+		await get_tree().process_frame
+		var bnames := []
+		for bi in range(AudioServer.get_bus_count()):
+			bnames.append(AudioServer.get_bus_name(bi))
+		print("busvol: buses=%s (must be Master, Music, SFX)" % [bnames])
+		var m_idx := AudioServer.get_bus_index(EFSettings.BUS_MUSIC)
+		var s_idx := AudioServer.get_bus_index(EFSettings.BUS_SFX)
+		print("busvol: Music=%d -> '%s' | SFX=%d -> '%s' (both must send to Master)"
+			% [m_idx, AudioServer.get_bus_send(m_idx) if m_idx >= 0 else "?",
+				s_idx, AudioServer.get_bus_send(s_idx) if s_idx >= 0 else "?"])
+		print("busvol: routing — music bed='%s' war='%s' | sfx 3d='%s' ui='%s'"
+			% [music.bed.bus if music.bed != null else "?",
+				music.war.bus if music.war != null else "?",
+				probe._pool[0].bus, probe._ui_pool[0].bus])
+		var st_bv := _stash_user_file("settings.cfg")
+		EFSettings.reset_to_defaults()
+		EFSettings.apply_audio()
+		print("busvol: at full — Music %.2f dB SFX %.2f dB (both must be 0)"
+			% [AudioServer.get_bus_volume_db(m_idx),
+				AudioServer.get_bus_volume_db(s_idx)])
+		EFSettings.set_volume(EFSettings.BUS_SFX, 0.0)
+		var sfx_zero := AudioServer.get_bus_volume_db(s_idx)
+		print("busvol: SFX slider to zero — bus %.2f dB is_inf=%s SILENT=%s"
+			% [sfx_zero, is_inf(sfx_zero), sfx_zero == -INF])
+		print("busvol: ...and Music was not touched by it — %.2f dB (must be 0)"
+			% AudioServer.get_bus_volume_db(m_idx))
+		EFSettings.set_volume(EFSettings.BUS_MUSIC, 0.0)
+		var mus_zero := AudioServer.get_bus_volume_db(m_idx)
+		print("busvol: Music slider to zero — bus %.2f dB SILENT=%s"
+			% [mus_zero, mus_zero == -INF])
+		EFSettings.set_volume(EFSettings.BUS_SFX, 0.5)
+		print("busvol: SFX back to 50%% — bus %.2f dB (linear_to_db(0.5)=%.2f)"
+			% [AudioServer.get_bus_volume_db(s_idx), linear_to_db(0.5)])
+		EFSettings.set_volume(EFSettings.BUS_MASTER, 0.0)
+		print("busvol: Master to zero — bus %.2f dB SILENT=%s (kills everything)"
+			% [AudioServer.get_bus_volume_db(AudioServer.get_bus_index(
+				EFSettings.BUS_MASTER)),
+				AudioServer.get_bus_volume_db(AudioServer.get_bus_index(
+					EFSettings.BUS_MASTER)) == -INF])
+		EFSettings.reset_to_defaults()
+		EFSettings.apply_audio()
+		_restore_user_file("settings.cfg", st_bv)
+		print("busvol: player settings restored=%s" % [st_bv != ""])
+		get_tree().quit()
+		return
+
+	if uargs.has("--settings"):
+		# AC-7/AC-8/AC-9: set every value, save, throw memory away, reload — the
+		# reload is the "next launch" path, run for real rather than simulated.
+		var st_set := _stash_user_file("settings.cfg")
+		EFSettings.reset_to_defaults()
+		print("settings: defaults master=%.2f music=%.2f sfx=%.2f fullscreen=%s res=%s"
+			% [EFSettings.master, EFSettings.music, EFSettings.sfx,
+				EFSettings.fullscreen, EFSettings.resolution()])
+		EFSettings.set_volume(EFSettings.BUS_MASTER, 0.42)
+		EFSettings.set_volume(EFSettings.BUS_MUSIC, 0.0)
+		EFSettings.set_volume(EFSettings.BUS_SFX, 0.75)
+		EFSettings.set_fullscreen(true)
+		EFSettings.set_res_index(2)
+		# false, because the default is true — a round trip that writes the
+		# default proves nothing about whether the value survived the disk.
+		EFSettings.set_play_intro(false)
+		print("settings: wrote  master=%.2f music=%.2f sfx=%.2f fullscreen=%s res=%s"
+			% [EFSettings.master, EFSettings.music, EFSettings.sfx,
+				EFSettings.fullscreen, EFSettings.resolution()])
+		print("settings: %s exists=%s" % [EFSettings.PATH,
+			FileAccess.file_exists(EFSettings.PATH)])
+		EFSettings.reset_to_defaults()
+		print("settings: memory wiped   master=%.2f sfx=%.2f fullscreen=%s res=%s"
+			% [EFSettings.master, EFSettings.sfx, EFSettings.fullscreen,
+				EFSettings.resolution()])
+		EFSettings.load_settings()
+		var ok_rt: bool = is_equal_approx(EFSettings.master, 0.42) \
+			and EFSettings.music == 0.0 and is_equal_approx(EFSettings.sfx, 0.75) \
+			and EFSettings.fullscreen and EFSettings.res_index == 2 \
+			and not EFSettings.play_intro
+		print("settings: reloaded master=%.2f music=%.2f sfx=%.2f fullscreen=%s res=%s intro=%s"
+			% [EFSettings.master, EFSettings.music, EFSettings.sfx,
+				EFSettings.fullscreen, EFSettings.resolution(),
+				EFSettings.play_intro])
+		print("settings: ROUND TRIP=%s (must be true)" % ok_rt)
+		EFSettings.apply_audio()
+		var si2 := AudioServer.get_bus_index(EFSettings.BUS_SFX)
+		var mi2 := AudioServer.get_bus_index(EFSettings.BUS_MUSIC)
+		print("settings: mixer followed the reload — SFX %.2f dB Music %.2f dB (Music must be -inf)"
+			% [AudioServer.get_bus_volume_db(si2),
+				AudioServer.get_bus_volume_db(mi2)])
+		# an out-of-range index on disk must not be able to crash a later launch
+		var bad := ConfigFile.new()
+		bad.set_value("video", "res_index", 99)
+		bad.save(EFSettings.PATH)
+		EFSettings.load_settings()
+		print("settings: res_index 99 from disk clamps to %d -> %s"
+			% [EFSettings.res_index, EFSettings.resolution()])
+		# leave the machine exactly as it was found
+		EFSettings.reset_to_defaults()
+		EFSettings.apply_video()
+		EFSettings.apply_audio()
+		_restore_user_file("settings.cfg", st_set)
+		print("settings: player settings restored=%s" % [st_set != ""])
+		get_tree().quit()
+		return
+
+	if uargs.has("--onboard"):
+		# AC-1..AC-6, end to end. Every prompt is reached through the trigger a
+		# player would reach it through — nothing calls show_hint() directly —
+		# and in the order a player would meet them.
+		_on_campaign_start(1)
+		rig.set_process(false)
+		rig.set_process_unhandled_input(false)
+		# The 20 s idle clock is real; it just runs faster. mission_t accumulates
+		# the same scaled delta _wait_seconds counts, so the two stay honest.
+		Engine.time_scale = 4.0
+		for i in range(10):
+			await get_tree().process_frame
+
+		await _wait_until(func(): return ui.hints_shown.size() >= 1, 10.0)
+		print("onboard AC-1 [M1 begins] %s" % _hint_at(0))
+
+		# AC-2: issue nothing at all, and let the mission clock run past 20 s
+		await _wait_until(func(): return ui.hints_shown.size() >= 2, 60.0)
+		print("onboard AC-2 [no order by t=%.0fs, player_ordered=%s] %s"
+			% [campaign.mission_t, player_ordered, _hint_at(1)])
+
+		# AC-3a: a click on a DISABLED tab item, through ui's real handler
+		var lmb := InputEventMouseButton.new()
+		lmb.button_index = MOUSE_BUTTON_LEFT
+		lmb.pressed = true
+		print("onboard AC-3a: airfield prereq_ok=%s (must be false — it is greyed out)"
+			% buildings.prereq_ok("airfield"))
+		ui._on_item_gui_input(lmb, "BASE", "airfield")
+		await _wait_until(func(): return ui.hints_shown.size() >= 3, 15.0)
+		print("onboard AC-3a [clicked a disabled AIRFIELD] %s" % _hint_at(2))
+
+		# AC-3b: an item that is unlocked but unaffordable
+		economy.credits[player_fac] = 50
+		buildings.click_item("BASE", "boiler")
+		await _wait_until(func(): return ui.hints_shown.size() >= 4, 15.0)
+		print("onboard AC-3b [BOILER HOUSE on $50] %s" % _hint_at(3))
+
+		# AC-4: finish goal 0 for real and watch it name goal 1
+		economy.credits[player_fac] = 3000
+		var s_ob: Vector2i = world.faction_start(player_fac)
+		campaign._prebuild("boiler", player_fac, s_ob + Vector2i(-5, -5))
+		campaign._prebuild("barracks", player_fac, s_ob + Vector2i(5, -5))
+		await _wait_until(func(): return ui.hints_shown.size() >= 5, 15.0)
+		print("onboard AC-4 [goal 0 done, objectives %s] %s"
+			% [campaign.obj_done, _hint_at(4)])
+		print("onboard AC-4: names the next objective=%s (must be true)"
+			% _hint_at(4).contains(String(EFCampaign.MISSIONS[1]["objectives"][1])))
+
+		# AC-5: overdraw the grid until the turrets would hold fire
+		var pw0 := buildings.power_report(player_fac)
+		for k in range(9):
+			campaign._prebuild("gun_turret", player_fac,
+				s_ob + Vector2i(-8 + k * 2, 7))
+		var pw1 := buildings.power_report(player_fac)
+		print("onboard AC-5: power made %d->%d drawn %d->%d low_power=%s"
+			% [pw0.x, pw1.x, pw0.y, pw1.y, buildings.low_power(player_fac)])
+		await _wait_until(func(): return ui.hints_shown.size() >= 6, 15.0)
+		print("onboard AC-5 [grid overdrawn] %s" % _hint_at(5))
+
+		# AC-6: pull every trigger again. Note that NONE of the conditions have
+		# been cleared — the clock is still past 20 s, no order has been given,
+		# goal 0 is still done and the grid is still overdrawn — so the only
+		# thing that can hold these back is the once-per-mission guard itself.
+		var before_n := ui.hints_shown.size()
+		buildings.queues["BASE"] = null
+		economy.credits[player_fac] = 10
+		ui._on_item_gui_input(lmb, "BASE", "airfield")
+		buildings.click_item("BASE", "barracks")
+		await _wait_seconds(30.0)
+		print("onboard AC-6: %d prompts before re-triggering, %d after (must match)"
+			% [before_n, ui.hints_shown.size()])
+		print("onboard AC-6: %d of M1's %d prompts have fired; the one still held back is the goal-1 prompt, and goal 1 is not done"
+			% [campaign._hints_fired.size(), campaign._hints.size()])
+		for hi in range(ui.hints_shown.size()):
+			print("   %d. %s" % [hi + 1, ui.hints_shown[hi]])
+		Engine.time_scale = 1.0
+		get_tree().quit()
+		return
+
+	if uargs.has("--onboard-off"):
+		# AC-14: the same triggers, on a mission that never asked to teach.
+		var oi := uargs.find("--onboard-off")
+		var omid := 2
+		if oi + 1 < uargs.size() and not uargs[oi + 1].begins_with("--"):
+			omid = int(uargs[oi + 1])
+		_on_campaign_start(omid)
+		rig.set_process(false)
+		rig.set_process_unhandled_input(false)
+		Engine.time_scale = 4.0
+		for i in range(10):
+			await get_tree().process_frame
+		var olmb := InputEventMouseButton.new()
+		olmb.button_index = MOUSE_BUTTON_LEFT
+		olmb.pressed = true
+		ui._on_item_gui_input(olmb, "BASE", "airfield")
+		economy.credits[player_fac] = 5
+		buildings.click_item("BASE", "boiler")
+		# well past M1's 20 s idle prompt, with no order ever issued
+		await _wait_seconds(40.0)
+		var ocfg: Dictionary = EFCampaign.MISSIONS[omid]
+		print("onboard-off: mission %d [%s] has_hints_key=%s"
+			% [omid, String(ocfg["title"]), ocfg.has("hints")])
+		print("onboard-off: t=%.0fs player_ordered=%s deny_pending=%s low_power=%s"
+			% [campaign.mission_t, player_ordered, not buildings.last_deny.is_empty(),
+				buildings.low_power(player_fac)])
+		print("onboard-off: prompts shown=%d %s (must be 0 and empty)"
+			% [ui.hints_shown.size(), ui.hints_shown])
+		print("onboard-off: mission still live=%s objectives=%s"
+			% [campaign.active, campaign.obj_done])
+		Engine.time_scale = 1.0
+		get_tree().quit()
+		return
+
 	if uargs.has("--missioncheck"):
 		# boot one mission and report what its data-driven hooks actually did
 		var ci := uargs.find("--missioncheck")
@@ -233,6 +616,9 @@ func _ready() -> void:
 		var st_mode := "1v1"
 		var st_ally := 0
 		var st_map := "res://maps/ashfall_plain.txt"
+		var mi2 := uargs.find("--mapfile")
+		if mi2 != -1 and mi2 + 1 < uargs.size():
+			st_map = "res://maps/%s.txt" % String(uargs[mi2 + 1])
 		if uargs.has("--ffa"):
 			st_mode = "ffa"
 			st_map = "res://maps/the_cradle_crown.txt"
@@ -240,16 +626,53 @@ func _ready() -> void:
 			st_mode = "2v2"
 			st_ally = 3 if pfac != 3 else 4
 			st_map = "res://maps/the_cradle_crown.txt"
+		# --crawlstart begins the match with crawlers WITHOUT running the --mcv
+		# selftest block, which razes the player's posts and ends the game (and
+		# with it stops every AI) — useless for watching an AI develop.
 		_start_game(pfac, efac, st_map, 2, false,
-			uargs.has("--mcv"), st_mode, st_ally)
+			uargs.has("--mcv") or uargs.has("--crawlstart"), st_mode, st_ally)
 		_maybe_selftest()
 		return
 	if FileAccess.file_exists("user://load.flag"):
 		DirAccess.open("user://").remove("load.flag")
 		_load_game()
 		return
+	# --- VANTA CORE -----------------------------------------------------------
+	# Below the load.flag return ON PURPOSE. F9 quickload reloads the scene with
+	# the same (empty) argv a real launch has, so it is position — not the argv
+	# test — that keeps the logo out of a resume. The argv test is the same
+	# real-launch idiom _ready() already uses to decide whether to apply_video(),
+	# repeated because an orphan dev flag (a bare --march, --norelief) falls
+	# through to here with a NON-empty argv, and nobody debugging a unit test
+	# wants to sit through fifteen seconds of logo.
+	var did_intro := false
+	if not _intro_played:
+		# Latch FIRST, and whether or not we actually play. "Has this process
+		# already decided about the logo" is a different question from "did the
+		# logo run", and conflating them costs you this: boot with PLAY INTRO
+		# off (so the latch never sets), turn it on from the pause menu
+		# mid-match, then QUIT TO MENU — the reload finds the flag true and the
+		# latch false, and the studio logo plays in the middle of the session.
+		_intro_played = true
+		if EFSettings.play_intro and OS.get_cmdline_user_args().is_empty():
+			did_intro = true
+			await _play_intro()
 	menu = EFMenu.new()
 	add_child(menu)
+	if did_intro:
+		# the logo faded to black; the title hall now fades IN from that same
+		# black instead of popping — the two halves of one smooth handoff
+		var veil := CanvasLayer.new()
+		veil.layer = 101
+		add_child(veil)
+		var vr := ColorRect.new()
+		vr.color = Color(0, 0, 0, 1)
+		vr.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+		vr.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		veil.add_child(vr)
+		var tw := create_tween()
+		tw.tween_property(vr, "color:a", 0.0, 0.6)
+		tw.tween_callback(veil.queue_free)
 	if music != null:
 		music.play_menu()
 	menu.start_requested.connect(_on_menu_start)
@@ -271,6 +694,20 @@ func _menushot(uargs: PackedStringArray) -> void:
 	get_viewport().get_texture().get_image().save_png(path)
 	print("menu screenshot -> ", path)
 	get_tree().quit()
+
+
+func _play_intro() -> void:
+	intro = EFIntro.new()
+	add_child(intro)
+	# is_done BEFORE the await, not after: a missing video finishes via
+	# call_deferred, which can land before we get here — awaiting a signal that
+	# already fired would stall the boot forever on a black screen.
+	if not intro.is_done:
+		await intro.done
+	intro.queue_free()
+	intro = null
+	await get_tree().process_frame     # let layer 100 actually leave before the
+	                                   # title hall paints its first frame
 
 
 func _on_menu_start(fac: int, foe: int, map_path: String, difficulty: int,
@@ -321,6 +758,8 @@ func _start_game(p_fac: int, e_fac: int, map_path: String, difficulty := 2,
 	cur_difficulty = difficulty
 	cur_mcv_start = mcv_start
 	cur_map = map_path
+	if audio:
+		audio.announcer_fac = p_fac
 
 	world = EFWorld.new()
 	# slots 1..N on the map, player first, ally (if any) second
@@ -451,9 +890,12 @@ func _start_game(p_fac: int, e_fac: int, map_path: String, difficulty := 2,
 		army.set_stance_selected(s)
 		ui.announce(s, Color(0.72, 0.86, 1.0)))
 	ui.anthem_pressed.connect(_toggle_anthem)
+	ui.settings_pressed.connect(_open_settings)
+	ui.quit_to_menu_pressed.connect(_quit_to_menu)
 	economy.field_depleted.connect(ui.deplete_pixel)
 	economy.field_regrown.connect(ui.restore_pixel)
 	buildings.placed.connect(ui.refresh_tiles)
+	army.selection_cleared.connect(rig.release_follow)
 	army.superweapon_launched.connect(func(fac: int, _pos: Vector3):
 		if fac == player_fac:
 			ui.announce("%s LAUNCHED" % buildings.sw_name(fac), Color(0.89, 0.58, 0.23))
@@ -779,12 +1221,14 @@ func _process(_dt: float) -> void:
 	else:
 		_bld_marker.visible = false
 	ui.set_building(sel_building)
+	buildings.show_rally_for(sel_building)
 
 
 func _end_game(win: bool) -> void:
 	game_over = true
 	if audio:
 		audio.play_ui("victory" if win else "defeat", 0.0)
+		audio.announce("victory" if win else "defeat", true)
 	victory = win
 	army.set_process(false)
 	for a in ais:
@@ -845,6 +1289,34 @@ func _toggle_pause() -> void:
 	ui.show_pause(get_tree().paused)
 
 
+# --- settings, mid-battle (AC-10) -------------------------------------------------
+
+func _open_settings() -> void:
+	if _settings_panel != null:
+		return
+	_settings_panel = EFSettingsPanel.new()
+	_settings_panel.closed.connect(_close_settings)
+	# Added to ui, not to main: ui is the CanvasLayer the pause overlay lives on,
+	# and going in after it is what puts this in front of it.
+	ui.add_child(_settings_panel)
+
+
+func _close_settings() -> void:
+	if _settings_panel == null:
+		return
+	_settings_panel.queue_free()
+	_settings_panel = null
+
+
+func _quit_to_menu() -> void:
+	# The road R already takes from the game-over screen. Reload the scene and
+	# let _ready() raise the title hall from nothing; anything subtler would have
+	# to unpick a world, an army, an economy and three AI commanders by hand, and
+	# every one of those is a leak waiting to be found by the fifth stranger.
+	get_tree().paused = false
+	get_tree().reload_current_scene()
+
+
 func _unhandled_input(ev: InputEvent) -> void:
 	if ev is InputEventKey and ev.pressed and ev.keycode == KEY_F11:
 		var wm := DisplayServer.window_get_mode()
@@ -852,6 +1324,16 @@ func _unhandled_input(ev: InputEvent) -> void:
 			DisplayServer.WINDOW_MODE_WINDOWED
 			if wm == DisplayServer.WINDOW_MODE_FULLSCREEN
 			else DisplayServer.WINDOW_MODE_FULLSCREEN)
+		# F11 predates the settings screen and still works from anywhere, so it
+		# is the one thing that can make the stored setting a lie. Tell it.
+		EFSettings.sync_from_window()
+		return
+	# The settings screen owns ESC while it is up. Closing it must not also
+	# unpause the battle underneath, and P must not resume behind an open panel.
+	if _settings_panel != null:
+		if ev is InputEventKey and ev.pressed and (ev.keycode == KEY_ESCAPE
+				or ev.keycode == KEY_P):
+			_close_settings()
 		return
 	if world == null:
 		return
@@ -883,12 +1365,25 @@ func _unhandled_input(ev: InputEvent) -> void:
 			get_tree().reload_current_scene()
 		return
 	if _rmb_preview and ev is InputEventMouseButton and ev.pressed:
-		# while the preview is up the wheel cycles the shape instead of zooming
+		# While the preview is up the wheel AIMS the line — facing was the hard
+		# part of laying a formation, not shape, which moves to Shift+wheel.
+		# 45-degree snaps: eight compass points are every direction an RTS line
+		# actually needs, and snapping is what makes the wheel land exactly.
+		var wheel := 0
 		if ev.button_index == MOUSE_BUTTON_WHEEL_UP:
-			_shape_i = (_shape_i + EFArmy.SHAPES.size() - 1) % EFArmy.SHAPES.size()
-			return
+			wheel = -1
 		elif ev.button_index == MOUSE_BUTTON_WHEEL_DOWN:
-			_shape_i = (_shape_i + 1) % EFArmy.SHAPES.size()
+			wheel = 1
+		if wheel != 0:
+			if ev.shift_pressed:
+				_shape_i = (_shape_i + (1 if wheel > 0 else EFArmy.SHAPES.size() - 1)) 					% EFArmy.SHAPES.size()
+			else:
+				if _form_rot < 0.0:
+					var mp0 := get_viewport().get_mouse_position()
+					var p0 := army.ground_point(mp0, rig.cam)
+					var f0 := _formation_facing(p0) if p0 != Vector3.INF 						else Vector2(1, 0)
+					_form_rot = atan2(f0.y, f0.x)
+				_form_rot = fposmod(round(_form_rot / (PI / 4.0) + float(wheel)) 					* (PI / 4.0), TAU)
 			return
 
 	# Both modes below return before the release handler ever runs, so a
@@ -983,6 +1478,14 @@ func _unhandled_input(ev: InputEvent) -> void:
 			army.stop_selected()
 		elif ev.keycode == KEY_M:
 			_toggle_anthem()
+		elif ev.keycode == KEY_C:
+			rig.follow_on = not rig.follow_on
+			if not rig.follow_on:
+				rig.release_follow()
+			elif army.has_selection():
+				rig.follow_group(army.selection)
+			ui.announce("ESCORT CAMERA %s" % ("ON" if rig.follow_on else "OFF"),
+				Color(0.72, 0.86, 1.0))
 		elif ev.keycode == KEY_X and army.has_selection():
 			_deploy_selected()
 		elif ev.keycode == KEY_Z and army.has_selection():
@@ -1020,15 +1523,46 @@ func _issue_right_click(screen_pos: Vector2, held: bool) -> void:
 	if structures.selected >= 0:
 		structures.unload(structures.selected, p)      # unload ignores formations
 		army.mark(p)
+		player_ordered = true
+	elif sel_building >= 0 and buildings.is_factory(sel_building) \
+			and int(buildings.list[sel_building]["faction"]) == player_fac:
+		# right-click with a factory selected plants its rally point: everything
+		# it produces from now on marches there instead of milling at the door
+		buildings.set_rally(sel_building, p)
+		army.mark(p)
+		ui.announce("RALLY POINT SET", Color(0.55, 0.85, 0.5))
+		player_ordered = true
 	elif army.has_selection():
 		if held:
-			army.order_formation(p, _formation_facing(p), EFArmy.SHAPES[_shape_i])
+			army.order_formation(_formation_anchor(p), _formation_facing(p),
+				EFArmy.SHAPES[_shape_i])
 		else:
 			army.order_smart(p, structures,
 				army.ray_point_at_y(screen_pos, rig.cam, EFUnit.ALT))
+		player_ordered = true
+		# trail the group they just sent (no-op unless the player enabled it)
+		rig.follow_group(army.selection)
+
+
+# Dragging used to BOTH aim and displace: the formation landed at the point
+# the mouse had been dragged TO, so aiming a line north also pushed the whole
+# line north — aiming and placing fought over one mouse. While a drag is
+# aiming, the line stays planted where the button went DOWN.
+func _formation_anchor(point: Vector3) -> Vector3:
+	if _form_rot >= 0.0:
+		return point
+	var press := army.ground_point(_rmb_pos, rig.cam)
+	if press != Vector3.INF:
+		var drag := Vector2(point.x - press.x, point.z - press.z)
+		if drag.length() > 1.5:
+			return press
+	return point
 
 
 func _formation_facing(point: Vector3) -> Vector2:
+	# the wheel-aimed direction beats everything: the player has stated one
+	if _form_rot >= 0.0:
+		return Vector2(cos(_form_rot), sin(_form_rot))
 	# dragging while held aims the line; otherwise it faces the way they march
 	var press := army.ground_point(_rmb_pos, rig.cam)
 	if press != Vector3.INF:
@@ -1061,7 +1595,9 @@ func _formation_preview_tick() -> void:
 	# wheel branch was not enough — the camera had already zoomed
 	rig.wheel_blocked = true
 	var list := army.formation_units()
-	var slots := army.formation_slots(list, p, _formation_facing(p),
+	var fp := _formation_anchor(p)
+	var fdir := _formation_facing(p)
+	var slots := army.formation_slots(list, fp, fdir,
 		EFArmy.SHAPES[_shape_i])
 	for i in range(_ghost_pool.size()):
 		_ghost_pool[i].visible = false
@@ -1074,6 +1610,31 @@ func _formation_preview_tick() -> void:
 		g.position = Vector3(slots[i].x, 0.09, slots[i].z)
 		g.visible = true
 	ui.set_formation_hint(EFArmy.SHAPES[_shape_i], slots.size())
+	# the arrow: none of those discs say which way the men will FACE, and
+	# facing is the whole reason the preview exists
+	if _face_ghost == null:
+		var cone := CylinderMesh.new()
+		cone.top_radius = 0.0
+		cone.bottom_radius = 0.55
+		cone.height = 1.5
+		cone.radial_segments = 10
+		_face_ghost = MeshInstance3D.new()
+		_face_ghost.mesh = cone
+		var am := StandardMaterial3D.new()
+		am.albedo_color = Color(1.0, 0.84, 0.3, 0.55)
+		am.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		am.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		_face_ghost.material_override = am
+		_face_ghost.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		add_child(_face_ghost)
+	var fnorm := fdir.normalized()
+	var fext := 1.0
+	for sv in slots:
+		fext = maxf(fext, Vector2(sv.x - fp.x, sv.z - fp.z).length())
+	_face_ghost.position = Vector3(fp.x + fnorm.x * (fext + 1.6), 0.14,
+		fp.z + fnorm.y * (fext + 1.6))
+	_face_ghost.rotation = Vector3(PI / 2.0, atan2(fnorm.x, fnorm.y), 0.0)
+	_face_ghost.visible = true
 
 
 func _make_slot_ghost() -> MeshInstance3D:
@@ -1097,6 +1658,9 @@ func _make_slot_ghost() -> MeshInstance3D:
 
 func _hide_formation_preview() -> void:
 	_rmb_preview = false
+	_form_rot = -1.0
+	if _face_ghost != null:
+		_face_ghost.visible = false
 	if rig != null:
 		rig.wheel_blocked = false
 	for g in _ghost_pool:
@@ -1198,7 +1762,15 @@ func _setup_sky_and_light() -> void:
 	sun.light_color = Color(1.0, 0.92, 0.8)
 	sun.light_energy = 1.25
 	sun.shadow_enabled = true
-	sun.directional_shadow_max_distance = 100.0
+	# Cascades tuned for a camera that never comes closer than ~24 m: the stock
+	# splits spend most of the shadow atlas on ground the RTS view never sees.
+	sun.directional_shadow_max_distance = 150.0
+	sun.directional_shadow_split_1 = 0.22
+	sun.directional_shadow_split_2 = 0.42
+	sun.directional_shadow_split_3 = 0.68
+	sun.directional_shadow_blend_splits = true
+	sun.directional_shadow_fade_start = 0.92
+	sun.shadow_normal_bias = 1.2
 	add_child(sun)
 
 	sun.light_angular_distance = 1.2       # a real disk, so LIGHT0_SIZE isn't 0
@@ -1237,18 +1809,42 @@ func _setup_sky_and_light() -> void:
 	env.ambient_light_energy = 1.0
 	env.tonemap_mode = Environment.TONE_MAPPER_AGX
 	env.tonemap_exposure = 1.15
+	# Glow tuned for a game named after burning stone: SCREEN blending and two
+	# wide levels give the ember fields a real halo instead of a thin rim.
 	env.glow_enabled = true
-	env.glow_intensity = 0.65
+	env.glow_blend_mode = Environment.GLOW_BLEND_MODE_SCREEN
+	env.glow_intensity = 0.9
+	env.glow_strength = 1.05
+	env.glow_bloom = 0.05
+	env.glow_hdr_threshold = 0.90
+	# set_glow_level indexes 0..6; the inspector labels those same levels 1..7.
+	# Asking for level 7 was off the end of the array — it raised an error every
+	# launch and the widest tier the halo was designed around never applied.
+	env.set_glow_level(5, 0.7)
+	env.set_glow_level(6, 0.35)
 	env.ssao_enabled = true
 	env.ssao_intensity = 1.6
+	# the default 1 m radius is wider than the gap under a tank, so contact
+	# darkening never bit at the track line
+	env.ssao_radius = 0.45
+	env.ssao_detail = 1.0
 	env.adjustment_enabled = true              # a touch of grade: richer, deeper
 	env.adjustment_contrast = 1.05
 	env.adjustment_saturation = 1.12
-	env.ssil_enabled = true                    # soft light bounce off the ash
+	env.ssil_enabled = false    # half-res + 4 blur passes for a bounce nobody can
+								# see at this camera height; it cost 0.4-0.8 ms and
+								# that budget buys the fog and glow work below
 	env.fog_enabled = true
 	env.fog_light_color = Color(0.56, 0.53, 0.47)
-	env.fog_density = 0.0022
+	env.fog_density = 0.0028
 	env.fog_sky_affect = 0.12       # was 0.25 — it washed out the sky's own contrast
+	# The honest substitute for the volumetric fog we had to abandon: ash pools
+	# in the low ground, distance takes on the sky's colour, and the sun bleeds
+	# through it when you look toward the light.
+	env.fog_height = 0.0
+	env.fog_height_density = 0.08
+	env.fog_aerial_perspective = 0.5
+	env.fog_sun_scatter = 0.20
 	# (volumetric fog tried and rejected: its froxel grid ends mid-view at
 	# RTS camera heights and renders as giant hard-edged slabs)
 
@@ -1269,9 +1865,14 @@ func save_game() -> void:
 		if b["hp"] <= 0:
 			continue
 		idx_map[k] = blds.size()
-		blds.append({"type": b["type"], "fac": b["faction"],
+		var entry := {"type": b["type"], "fac": b["faction"],
 			"ox": b["origin"].x, "oy": b["origin"].y, "hp": b["hp"],
-			"rep": buildings.repairing.has(k)})
+			"rep": buildings.repairing.has(k)}
+		var brp = b.get("rally", null)
+		if brp is Vector3:
+			entry["rx"] = brp.x
+			entry["rz"] = brp.z
+		blds.append(entry)
 	var units := []
 	for u in army.units:
 		if u.hp <= 0:
@@ -1360,6 +1961,9 @@ func _apply_save(data: Dictionary) -> void:
 			Vector2i(int(b["ox"]), int(b["oy"])), float(b["hp"]))
 		if b.get("rep", false):
 			buildings.repairing[buildings.list.size() - 1] = true
+		if b.has("rx"):
+			buildings.list[buildings.list.size() - 1]["rally"] = \
+				Vector3(float(b["rx"]), 0.0, float(b["rz"]))
 	for tab in data["queues"]:
 		var q = data["queues"][tab]
 		if q != null:
@@ -1464,6 +2068,36 @@ func _auto_place(id: String) -> bool:
 	return false
 
 
+func _hint_at(i: int) -> String:
+	return String(ui.hints_shown[i]) if i < ui.hints_shown.size() else "<NONE SHOWN>"
+
+
+# A dev flag must not cost the player their own settings. Same contract as the
+# campaign.cfg stash in --unlockcheck: take the real file out of the way, run
+# the test against a clean slate, put it back byte for byte.
+func _stash_user_file(fname: String) -> String:
+	var d := DirAccess.open("user://")
+	var text := ""
+	if d != null and d.file_exists(fname):
+		var fh := FileAccess.open("user://" + fname, FileAccess.READ)
+		if fh != null:
+			text = fh.get_as_text()
+			fh.close()
+		d.remove(fname)
+	return text
+
+
+func _restore_user_file(fname: String, text: String) -> void:
+	var d := DirAccess.open("user://")
+	if text != "":
+		var fw := FileAccess.open("user://" + fname, FileAccess.WRITE)
+		if fw != null:
+			fw.store_string(text)
+			fw.close()
+	elif d != null and d.file_exists(fname):
+		d.remove(fname)
+
+
 func _maybe_selftest() -> void:
 	var args := OS.get_cmdline_user_args()
 	var idx := args.find("--selftest")
@@ -1522,6 +2156,64 @@ func _run_selftest(path: String) -> void:
 				% [dur, before, after, music.bed.playing,
 					music.bed.playing and after < before])
 
+	if args.has("--damagefx"):
+		# wounded machines smoke, guns kick, treads scroll, booms pool
+		var sd: Vector2i = world.faction_start(player_fac)
+		var tank := army.spawn("bastion", player_fac, sd + Vector2i(6, 6))
+		await _wait_seconds(0.8)
+		# 1) tracks: a clear-lane drive, nothing to shoot along the way
+		army.selection = [tank]
+		army.order_move(Vector3((sd.x + 13.5) * T, 0, (sd.y + 6.5) * T))
+		await _wait_seconds(2.0)
+		print("damagefx: track phase %.2f m after a 2s drive (must be > 1)"
+			% tank._track_phase)
+		# 2) recoil: NOW give it something durable to shell, and poll the PEAK —
+		# recoil decays in ~0.2 s, so a late single read can miss a real shot
+		var prey := army.spawn("warpig", ai_fac,
+			Vector2i(int(tank.global_position.x / T) + 4,
+				int(tank.global_position.z / T)))
+		await _wait_seconds(0.3)
+		army.selection = [tank]
+		army.order_smart(prey.global_position, structures, Vector3.INF)
+		var peak := 0.0
+		var t_end := Time.get_ticks_msec() + 12000
+		while Time.get_ticks_msec() < t_end and peak <= 0.0:
+			peak = maxf(peak, tank.recoil_v)
+			await get_tree().process_frame
+		print("damagefx: peak recoil %.3f after firing (must be > 0)" % peak)
+		# 3) wound smoke: hurt the tank below the threshold and count puffs
+		army.damage_unit(tank, "CANNON", tank.max_hp * 0.6)
+		await _wait_seconds(1.5)
+		var live := 0
+		for s in army._puffs:
+			if bool(s["live"]):
+				live += 1
+		print("damagefx: %d live smoke puffs while wounded (must be > 0)" % live)
+		# 4) booms pool: fire one directly — no victim required
+		army._boom(tank.global_position + Vector3(3, 0, 0))
+		await _wait_seconds(0.1)
+		var booms := 0
+		for s2 in army._booms:
+			if bool(s2["live"]):
+				booms += 1
+		print("damagefx: %d live booms in the pool (must be > 0)" % booms)
+		if is_instance_valid(prey) and prey.hp > 0:
+			army.damage_unit(prey, "BLAST", 9999.0)
+		rig.center_on(tank.global_position.x, tank.global_position.z)
+		rig.target_dist = 16.0
+		rig.dist = 16.0
+
+	if args.has("--soldiercloseup"):
+		# a squad at minimum zoom: the only honest way to judge the sculpt
+		var sc2: Vector2i = world.faction_start(player_fac)
+		var sq := army.spawn("iron_guard", player_fac, sc2 + Vector2i(6, 6))
+		await _wait_seconds(1.0)
+		rig.center_on(sq.global_position.x, sq.global_position.z)
+		rig.dist = 14.0
+		rig.target_dist = 14.0
+		rig.cam.position = Vector3(0, 0, rig.dist)
+		await _wait_seconds(0.6)
+
 	if args.has("--closeup"):
 		# full zoom-in on the player's base: the only view where surface detail
 		# on a 3 m building is bigger than a pixel
@@ -1548,6 +2240,1121 @@ func _run_selftest(path: String) -> void:
 		rig.target_dist = 54.0
 		rig.cam.position = Vector3(0, 0, rig.dist)
 		await _wait_seconds(2.0)
+
+	if args.has("--embershot"):
+		# park on the largest ember field (the one nearest map centre) so a glow
+		# change is judged on the thing the glow was tuned for
+		var ec := Vector2i(int(world.w / 2), int(world.h / 2))
+		var best_e := Vector2i(-1, -1)
+		var best_d := 1 << 30
+		for et in world.ember_tiles:
+			var ed: int = absi(et.x - ec.x) + absi(et.y - ec.y)
+			if ed < best_d:
+				best_d = ed
+				best_e = et
+		if best_e.x >= 0:
+			rig.center_on((best_e.x + 0.5) * T, (best_e.y + 0.5) * T)
+			rig.dist = 18.0
+			rig.target_dist = 18.0
+			rig.cam.position = Vector3(0, 0, rig.dist)
+		# the field is deep in unscouted ground: lift the shroud quad or the
+		# screenshot is a black rectangle
+		if world._shroud_mi != null:
+			world._shroud_mi.visible = false
+		print("embershot: centred on ember tile %s of %d on the map"
+			% [best_e, world.ember_tiles.size()])
+		await _wait_seconds(1.5)
+
+	if args.has("--aiopen"):
+		# A crawler-start commander used to deploy and then freeze forever.
+		# Watch a real AI's economy actually come up.
+		await _wait_seconds(45.0)
+		var afac := ai_fac
+		var counts := {}
+		for b in buildings.list:
+			if b["faction"] == afac and b["hp"] > 0:
+				counts[b["type"]] = int(counts.get(b["type"], 0)) + 1
+		var harv := 0
+		var mil := 0
+		for u in army.units:
+			if u.faction == afac and u.hp > 0:
+				if u.is_harvester():
+					harv += 1
+				elif not u.weapon.is_empty():
+					mil += 1
+		var brain: EFAI = null
+		for a in ais:
+			if a.fac == afac:
+				brain = a
+		print("aiopen: t=45s state=%s buildings=%s harvesters=%d military=%d credits=%d"
+			% [brain.state if brain else "?", counts, harv, mil,
+				economy.credits.get(afac, 0)])
+		print("aiopen: has refinery=%s (the deadlock left this false forever)"
+			% buildings._owns(afac, "refinery"))
+		print("aiopen: left OPENING=%s (must be true)"
+			% [brain != null and brain.state != "OPENING"])
+
+	if args.has("--vehbake"):
+		var s0v: Vector2i = world.faction_start(player_fac)
+		var kinds_v := ["bastion", "outrider", "mule", "sparrowhawk"]
+		var made: Array[EFUnit] = []
+		for i in range(kinds_v.size()):
+			made.append(army.spawn(kinds_v[i], player_fac,
+				s0v + Vector2i(5 + i * 3, 5)))
+		await _wait_seconds(1.0)
+		for i in range(made.size()):
+			var u: EFUnit = made[i]
+			# count real submitted surfaces, not nodes
+			var surfaces := 0
+			var nodes := 0
+			for c in u.find_children("*", "MeshInstance3D", true, false):
+				var mi := c as MeshInstance3D
+				if mi.mesh == null or not mi.visible:
+					continue
+				nodes += 1
+				surfaces += mi.mesh.get_surface_count()
+			print("vehbake: %-12s %d mesh nodes, %d surfaces submitted"
+				% [kinds_v[i], nodes, surfaces])
+		# a propeller must still exist and still spin
+		var plane: EFUnit = made[3]
+		# compare the whole basis: the prop spins about its LOCAL up while the
+		# node itself is pitched 90 degrees, so no single euler axis is reliable
+		var p0 := Basis.IDENTITY
+		if plane._prop != null:
+			p0 = plane._prop.transform.basis
+		await _wait_seconds(0.8)
+		var spun := plane._prop != null \
+			and not plane._prop.transform.basis.is_equal_approx(p0)
+		print("vehbake: sparrowhawk prop present=%s and still spinning=%s (must be true)"
+			% [plane._prop != null, spun])
+		rig.center_on((s0v.x + 8.5) * T, (s0v.y + 5.5) * T)
+		rig.target_dist = 18.0
+		rig.dist = 18.0
+		await _wait_seconds(0.4)
+
+	if args.has("--aistance"):
+		# the AI now uses the player's stances: home guard digs in, and the
+		# Brutal gun line roots its cannon vehicles at siege range
+		var brain: EFAI = ais[0]
+		var ah: Vector2i = world.faction_start(ai_fac)
+		for i in range(8):
+			army.spawn(["conscript", "sapper"][i % 2], ai_fac,
+				ah + Vector2i(-3 + (i % 4) * 2, 5 + (i / 4) * 2))
+		await _wait_seconds(4.0)
+		var dug := 0
+		for u in army.units:
+			if u.faction == ai_fac and u.hp > 0 and u.fort_ref >= 0:
+				dug += 1
+		print("aistance: after 4s the home guard dug in %d forts (must be > 0, cap 6)" % dug)
+		brain._mobilize_all()
+		await _wait_seconds(0.2)
+		var still := 0
+		for u2 in army.units:
+			if u2.faction == ai_fac and u2.hp > 0 and u2.fort_ref >= 0:
+				still += 1
+		print("aistance: after mobilize %d remain dug in (must be 0)" % still)
+		# brutal artillery: a cannon vehicle at siege range of the player HQ
+		brain.diff_lvl = 3
+		brain.state = "WAVE"
+		var php: Vector2i = world.faction_start(player_fac)
+		var gun := army.spawn("bastion", ai_fac, php + Vector2i(6, 0))
+		await _wait_seconds(0.1)
+		brain._stance_tick()
+		print("aistance: brutal bastion at siege range deployed=%s (stance %d, must be 1)"
+			% [gun.stance == 1, gun.stance])
+		brain.state = "ECONOMY"
+
+	if args.has("--rally"):
+		# prove the rally through the REAL production path, not by calling
+		# set_rally and reading it back
+		var sr: Vector2i = world.faction_start(player_fac)
+		var bidx := -1
+		for k in range(buildings.list.size()):
+			if buildings.list[k]["type"] == "barracks" \
+					and buildings.list[k]["faction"] == player_fac:
+				bidx = k
+		if bidx < 0:
+			# raise one next to the start so the test stands alone
+			buildings._create("barracks", player_fac, sr + Vector2i(5, 2))
+			for k2 in range(buildings.list.size()):
+				if buildings.list[k2]["type"] == "barracks":
+					bidx = k2
+		var rally := Vector3((sr.x + 14.5) * T, 0, (sr.y + 2.5) * T)
+		sel_building = bidx
+		buildings.set_rally(bidx, rally)
+		print("rally: set on barracks %d -> %s | pennant visible=%s"
+			% [bidx, rally, buildings._rally_node.visible])
+		buildings.train_spawn("iron_guard", player_fac)
+		await _wait_seconds(0.3)
+		var newest: EFUnit = null
+		for u in army.units:
+			if u.kind == "iron_guard" and u.faction == player_fac:
+				newest = u
+		var going := newest != null and not newest.path.is_empty()
+		await _wait_seconds(9.0)
+		var d := 999.0
+		if newest != null:
+			d = newest.global_position.distance_to(rally)
+		print("rally: fresh recruit pathed=%s, ended %.1f m from the rally (must be < 4)"
+			% [going, d])
+		sel_building = -1
+		buildings.show_rally_for(-1)
+		print("rally: pennant hidden after deselect=%s" % [not buildings._rally_node.visible])
+		# minimap blips: count what a redraw would draw, through the same rules
+		var vis_units := 0
+		var hid_units := 0
+		for u2 in army.units:
+			if u2.hp <= 0 or u2.garrisoned_in >= 0 or u2.stowed:
+				continue
+			if u2.faction != player_fac and not u2.visible:
+				hid_units += 1
+			else:
+				vis_units += 1
+		print("rally: minimap would blip %d units, fog hides %d enemies (hidden must be > 0 on a fresh map)"
+			% [vis_units, hid_units])
+
+	if args.has("--facing"):
+		# A static lineup cannot reveal a backwards model: only motion can.
+		# Drive each pipeline unit east and compare where its NOSE points to
+		# where it is actually travelling.
+		var fs: Vector2i = world.faction_start(player_fac)
+		var subjects: Array[EFUnit] = []
+		for i in range(3):
+			subjects.append(army.spawn(["bastion", "juggernaut", "outrider"][i],
+				player_fac, fs + Vector2i(4, 4 + i * 3)))
+		await _wait_seconds(1.0)
+		army.selection = subjects
+		army.order_move(Vector3((fs.x + 26.5) * T, 0, (fs.y + 7.5) * T))
+		await _wait_seconds(4.0)
+		for u in subjects:
+			# -Z is forward in Godot; compare the hull's facing to its velocity
+			var fwd := -u.global_transform.basis.z
+			var vel := u.vel
+			vel.y = 0.0
+			var agree := 0.0
+			if vel.length() > 0.3:
+				agree = fwd.normalized().dot(vel.normalized())
+			print("facing: %-11s nose-vs-travel %+.2f  %s"
+				% [u.kind, agree,
+					"FORWARD" if agree > 0.5 else
+					("BACKWARDS" if agree < -0.5 else "turning/idle")])
+		rig.center_on((fs.x + 12.0) * T, (fs.y + 7.5) * T)
+		rig.dist = 24.0
+		rig.target_dist = 24.0
+		rig.cam.position = Vector3(0, 0, rig.dist)
+		await _wait_seconds(0.4)
+
+	if args.has("--karvath"):
+		# the pipeline batch, lined up beside the units they replace
+		var kb: Vector2i = world.faction_start(player_fac)
+		# two rows, not one long line: a 40-tile row forced the camera so far
+		# back that a reversed nose was unreadable, which is the one thing
+		# this lineup exists to catch
+		var row := [["pavise", 0, 0], ["dart", 5, 0], ["zephyr", 10, 0],
+			["dray", 15, 0], ["keelwright", 21, 0],
+			["sky_marine", 0, 8], ["wasp", 5, 8], ["sparrowhawk", 10, 8],
+			["pelican", 16, 8], ["leviathan", 23, 8]]
+		if player_fac == 1:
+			row = [["bastion", 0, 0], ["outrider", 5, 0], ["sperrwagen", 10, 0],
+				["mule", 15, 0], ["forge_crawler", 21, 0],
+				["iron_guard", 0, 8], ["hammerfall", 5, 8],
+				["kondor", 11, 8], ["juggernaut", 18, 8]]
+		elif player_fac == 2:
+			row = [["rat", 0, 0], ["warpig", 5, 0], ["stovepipe", 10, 0],
+				["magpie", 15, 0], ["scrap_hauler", 21, 0],
+				["conscript", 0, 8], ["vulture", 4, 8],
+				["duster", 11, 8], ["ashworm", 18, 8]]
+		elif player_fac == 4:
+			row = [["glimmer", 0, 0], ["faraday", 5, 0], ["ion_carriage", 10, 0],
+				["collector", 15, 0], ["dynamo", 20, 0],
+				["arc_templar", 0, 8], ["lance_warden", 4, 8],
+				["ark_carriage", 9, 8], ["seraph", 15, 8], ["cathedral", 22, 8]]
+		# --pick KIND spawns that one unit alone and frames it tight: a lineup
+		# shot is too small to tell a shading bug from a mesh bug
+		var pick := ""
+		var qi := args.find("--pick")
+		if qi != -1 and qi + 1 < args.size():
+			pick = String(args[qi + 1])
+		var made: Array[EFUnit] = []
+		for e in row:
+			if pick != "" and String(e[0]) != pick:
+				continue
+			var u := army.spawn(String(e[0]), player_fac,
+				kb + Vector2i(3 + (0 if pick != "" else int(e[1])),
+					4 + (4 if pick != "" else int(e[2]))))
+			made.append(u)
+		await _wait_seconds(1.2)
+		for u2 in made:
+			print("karvath: %-11s custom=%s radius=%.2f props=%d"
+				% [u2.kind, u2.custom_model, u2.radius,
+					u2._props.size() + (1 if u2._prop != null else 0)])
+			if not args.has("--dump"):
+				continue
+			if u2._merged != null and u2._merged.mesh != null:
+				var ab: AABB = u2._merged.mesh.get_aabb()
+				print("    aabb pos (%.2f, %.2f, %.2f) size (%.2f, %.2f, %.2f)"
+					% [ab.position.x, ab.position.y, ab.position.z,
+						ab.size.x, ab.size.y, ab.size.z])
+				for si in range(u2._merged.mesh.get_surface_count()):
+					var m := u2._merged.mesh.surface_get_material(si)
+					var mn := "null"
+					if m != null:
+						mn = "%s '%s'" % [m.get_class(), m.resource_name]
+						if m is BaseMaterial3D:
+							var t: Texture2D = (m as BaseMaterial3D).albedo_texture
+							mn += " tex=%s vc=%s" % [
+								"null" if t == null else t.get_class(),
+								(m as BaseMaterial3D).vertex_color_use_as_albedo]
+					print("    surf %d: %s" % [si, mn])
+			for p in u2._props:
+				print("    prop @ (%.2f, %.2f, %.2f) r=%.2f"
+					% [p.position.x, p.position.y, p.position.z,
+						(p.mesh as CylinderMesh).top_radius])
+			if u2._insig_mi == null:
+				print("    insignia: NONE")
+			else:
+				var ia: AABB = u2._insig_mi.mesh.get_aabb()
+				print("    insignia: %d verts, aabb pos (%.2f, %.2f, %.2f) size (%.2f, %.2f, %.2f) vis=%s"
+					% [u2._insig_mi.mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX].size(),
+						ia.position.x, ia.position.y, ia.position.z,
+						ia.size.x, ia.size.y, ia.size.z, u2._insig_mi.visible])
+		rig.center_on((kb.x + (3.0 if pick != "" else 15.0)) * T,
+			(kb.y + 8.5) * T)
+		rig.dist = 18.0 if pick != "" else 34.0
+		rig.target_dist = rig.dist
+		rig.cam.position = Vector3(0, 0, rig.dist)
+		if world._shroud_mi != null:
+			world._shroud_mi.visible = false
+		await _wait_seconds(0.6)
+
+	if args.has("--bldshow"):
+		# One of every structure, laid out on open ground and framed together.
+		# The base only ever contains the two or three a match has built by the
+		# time a selftest fires, so there was no view that showed the pipeline
+		# buildings side by side.
+		var sb: Vector2i = world.faction_start(player_fac)
+		var lay := [["boiler", 0], ["barracks", 5], ["refinery", 10],
+			["vehicle_works", 16], ["airfield", 22], ["doomworks", 28],
+			["gun_turret", 34], ["aa_turret", 37]]
+		for e in lay:
+			buildings._create(String(e[0]), player_fac,
+				sb + Vector2i(6 + int(e[1]), 20), true)
+		await _wait_seconds(1.2)
+		if world._shroud_mi != null:
+			world._shroud_mi.visible = false
+		# --pick <id> frames ONE structure close. At the 62 m group distance a
+		# building is about a hundred pixels tall, which is too small to judge
+		# whether its trim and relief are landing — the first pipeline batch
+		# looked "flat" at group range and the real fault was only visible up close.
+		var bpick := ""
+		var bpi := args.find("--pick")
+		if bpi != -1 and bpi + 1 < args.size():
+			bpick = String(args[bpi + 1])
+		var bcx := sb.x + 25.0
+		var bcy := sb.y + 14.0
+		var bdist := 62.0
+		for e in lay:
+			if String(e[0]) == bpick:
+				bcx = sb.x + 6.0 + float(e[1]) + 1.5
+				bcy = sb.y + 20.0
+				bdist = 14.0
+		rig.center_on(bcx * T, bcy * T)
+		rig.dist = bdist
+		rig.target_dist = bdist
+		rig.cam.position = Vector3(0, 0, rig.dist)
+		print("bldshow: placed %d structures | framed %s at %.0f m"
+			% [lay.size(), bpick if bpick != "" else "all", bdist])
+		await _wait_seconds(0.5)
+
+	if args.has("--ruinview"):
+		# Frame a background ruin. They sit on fringe rock, scattered across the
+		# whole map, so no fixed camera finds one — ask the world which tiles it
+		# actually consumed.
+		var rk: Array = world._ruin_used.keys()
+		if rk.is_empty():
+			print("ruinview: no ruins on this map")
+		else:
+			# the keys are the FOUR tiles of each 2x2 footprint, so step by 4 to
+			# land on a different ruin rather than the next corner of this one
+			var rn := 0
+			var rpi := args.find("--pick")
+			if rpi != -1 and rpi + 1 < args.size():
+				rn = int(args[rpi + 1])
+			var ridx: int = clampi(rn * 4, 0, rk.size() - 1)
+			var rt: Vector2i = rk[ridx]
+			var rdist := 17.0
+			var rdi := args.find("--dist")
+			if rdi != -1 and rdi + 1 < args.size():
+				rdist = float(args[rdi + 1])
+			rig.center_on((rt.x + 0.5) * T, (rt.y + 1.5) * T)
+			rig.dist = rdist
+			rig.target_dist = rdist
+			rig.cam.position = Vector3(0, 0, rdist)
+			if world._shroud_mi != null:
+				world._shroud_mi.visible = false
+			print("ruinview: %d ruin tiles | framing (%d,%d) at %.0f m"
+				% [rk.size(), rt.x, rt.y, rdist])
+			await _wait_seconds(0.4)
+
+	if args.has("--hqview"):
+		# Close on the Command Post: the only structure that flies an ensign,
+		# and at base-overview range the flag is a dozen pixels of cloth.
+		var hb: Vector2i = world.faction_start(player_fac)
+		var hdist := 15.0
+		var hi := args.find("--dist")
+		if hi != -1 and hi + 1 < args.size():
+			hdist = float(args[hi + 1])
+		rig.center_on((hb.x + 2.6) * T, (hb.y + 0.2) * T)
+		rig.dist = hdist
+		rig.target_dist = hdist
+		rig.cam.position = Vector3(0, 0, hdist)
+		if world._shroud_mi != null:
+			world._shroud_mi.visible = false
+		print("hqview: faction %d post at (%d,%d) | camera %.0f m"
+			% [player_fac, hb.x, hb.y, hdist])
+		await _wait_seconds(0.5)
+
+	if args.has("--mtnview"):
+		# Frame the DEEPEST rock tile on the map — the core of the biggest
+		# massif — because that is where the depth-scaled height actually shows.
+		# Any fixed camera lands on open ground and reports "no mountains".
+		var dep := world.rock_depth()
+		var bx := 0
+		var by := 0
+		var bd := 0
+		for ty in range(world.h):
+			for tx in range(world.w):
+				var v: int = dep[ty * world.w + tx]
+				if v > bd:
+					bd = v
+					bx = tx
+					by = ty
+		var mdist := 46.0
+		var mi3 := args.find("--dist")
+		if mi3 != -1 and mi3 + 1 < args.size():
+			mdist = float(args[mi3 + 1])
+		rig.center_on((bx + 0.5) * T, (by + 6.0) * T)
+		rig.dist = mdist
+		rig.target_dist = mdist
+		rig.cam.position = Vector3(0, 0, mdist)
+		if world._shroud_mi != null:
+			world._shroud_mi.visible = false
+		print("mtnview: deepest rock tile (%d,%d) depth %d | camera %.0f m"
+			% [bx, by, bd, mdist])
+		await _wait_seconds(0.4)
+
+	if args.has("--formshot"):
+		# The preview tick runs off _rmb_down state every frame, so the whole
+		# formation UX can be driven headless: plant the press, warp the mouse,
+		# and photograph what a player would see. Frame A proves the drag AIMS
+		# without dragging the line away from the press point; frame B proves the
+		# wheel override rotates the arrow to a stated compass point.
+		var fsi := args.find("--selftest")
+		var fsbase := String(args[fsi + 1]).trim_suffix(".png")
+		var fsb: Vector2i = world.faction_start(player_fac)
+		var fsl: Array[EFUnit] = []
+		for fi in range(6):
+			fsl.append(army.spawn("bastion", player_fac,
+				fsb + Vector2i(14 + (fi % 3) * 2, 18 + (fi / 3) * 2)))
+		await _wait_seconds(0.8)
+		army.selection = fsl
+		if world._shroud_mi != null:
+			world._shroud_mi.visible = false
+		var fscene := Vector3((fsb.x + 24.0) * T, 0.0, (fsb.y + 19.0) * T)
+		rig.center_on(fscene.x, fscene.z)
+		rig.dist = 30.0
+		rig.target_dist = 30.0
+		rig.cam.position = Vector3(0, 0, rig.dist)
+		await get_tree().process_frame
+		await get_tree().process_frame
+		# press at the scene centre, drag 6 m north — the line must STAY at the
+		# press point and face north
+		var press3 := fscene
+		var drag3 := fscene + Vector3(0, 0, -6.0)
+		_rmb_pos = rig.cam.unproject_position(press3)
+		_rmb_down = true
+		_rmb_ms = 0
+		get_viewport().warp_mouse(rig.cam.unproject_position(drag3))
+		await _wait_seconds(0.3)
+		await RenderingServer.frame_post_draw
+		get_viewport().get_texture().get_image().save_png(fsbase + "_drag.png")
+		print("formshot: drag-aim ghosts=%d anchor should be press point (%.0f, %.0f)"
+			% [_ghost_pool.size(), press3.x, press3.z])
+		# wheel override: face WEST regardless of the mouse
+		_form_rot = PI
+		await _wait_seconds(0.25)
+		await RenderingServer.frame_post_draw
+		get_viewport().get_texture().get_image().save_png(fsbase + "_wheel.png")
+		print("formshot: wheel-aim rot=%.2f (west)" % _form_rot)
+		_rmb_down = false
+		_hide_formation_preview()
+
+	if args.has("--gaitshot"):
+		# Two frames a third of a stride apart prove the legs actually swing; a
+		# third frame catches the rifle kick. No transform test can see any of
+		# this — the whole gait lives in the vertex shader, so the only honest
+		# witnesses are the limb-tag histogram and the pictures.
+		var gsi := args.find("--selftest")
+		var gbase := String(args[gsi + 1]).trim_suffix(".png")
+		var gb: Vector2i = world.faction_start(player_fac)
+		var gu := army.spawn("iron_guard", player_fac, gb + Vector2i(16, 20))
+		await _wait_seconds(0.5)
+		# ONE man, not six: a full section from 52 degrees up is a blob in which
+		# no leg can be judged. Dropping hp to a sixth leaves a single soldier
+		# standing on the unit origin where the camera is aimed anyway.
+		gu.hp = gu.max_hp / 6.0 - 0.5
+		await _wait_seconds(1.2)
+		if gu._squad_mm != null:
+			var gam := gu._squad_mm.multimesh.mesh as ArrayMesh
+			for gs in range(gam.get_surface_count()):
+				var garr := gam.surface_get_arrays(gs)
+				var guvs: PackedVector2Array = garr[Mesh.ARRAY_TEX_UV]
+				var gbuckets := [0, 0, 0, 0, 0]
+				for gv in guvs:
+					gbuckets[clampi(int(round(gv.x)), 0, 4)] += 1
+				print("gaitshot: surface %d mat=%s limbs=%s" % [gs,
+					gam.surface_get_material(gs).get_class(), gbuckets])
+		if world._shroud_mi != null:
+			world._shroud_mi.visible = false
+		army.selection = [gu]
+		army.order_move(Vector3((gb.x + 56.0) * T, 0.0, (gb.y + 20.0) * T))
+		await _wait_seconds(1.6)
+		rig.center_on(gu.global_position.x + 1.2, gu.global_position.z)
+		rig.arm.rotation_degrees.x = -24.0    # low profile: legs in silhouette
+		rig.dist = 5.5
+		rig.target_dist = 5.5
+		rig.cam.position = Vector3(0, 0, rig.dist)
+		await _wait_seconds(0.12)
+		await RenderingServer.frame_post_draw
+		var gscr := rig.cam.unproject_position(gu.global_position + Vector3(0, 0.7, 0))
+		print("gaitshot: man at screen (%.0f, %.0f) alive=%d hp=%.0f"
+			% [gscr.x, gscr.y, gu._squad_alive, gu.hp])
+		get_viewport().get_texture().get_image().save_png(gbase + "_a.png")
+		await _wait_seconds(0.13)
+		rig.center_on(gu.global_position.x + 1.2, gu.global_position.z)
+		await RenderingServer.frame_post_draw
+		get_viewport().get_texture().get_image().save_png(gbase + "_b.png")
+		print("gaitshot: A/B saved  gait=%.2f amt=%.2f speed=%.2f"
+			% [gu._gait, gu._gait_amt, gu.vel.length()])
+		# halt, then park an enemy section in front of the guns for the kick
+		army.order_move(gu.global_position)
+		var gtile := Vector2i(int(gu.global_position.x / T) + 3,
+			int(gu.global_position.z / T))
+		var gef := 2 if player_fac != 2 else 1
+		army.spawn("conscript", gef, gtile)
+		var gkick := 0.0
+		for gwait in range(300):
+			await get_tree().process_frame
+			if gu._fire_kick > 0.55:
+				gkick = gu._fire_kick
+				break
+		rig.center_on(gu.global_position.x + 1.2, gu.global_position.z)
+		await RenderingServer.frame_post_draw
+		get_viewport().get_texture().get_image().save_png(gbase + "_fire.png")
+		print("gaitshot: fire kick %.2f at capture" % gkick)
+
+	if args.has("--aatest"):
+		# Turrets went silent the day the pipeline building models landed: the
+		# firing loop gated on a "Head" child the new single-mesh models do not
+		# have. This is the regression test — one turret of each type, powered,
+		# with one air and one ground enemy parked inside range. PASS = damage.
+		var ab2: Vector2i = world.faction_start(player_fac)
+		buildings._create("boiler", player_fac, ab2 + Vector2i(6, 2), true)
+		buildings._create("aa_turret", player_fac, ab2 + Vector2i(10, 6), true)
+		buildings._create("gun_turret", player_fac, ab2 + Vector2i(13, 6), true)
+		var afoe := army.spawn("sparrowhawk", ai_fac, ab2 + Vector2i(11, 8))
+		var gfoe := army.spawn("bastion", ai_fac, ab2 + Vector2i(14, 9))
+		await _wait_seconds(0.5)
+		var ah0: float = afoe.hp
+		var gh0: float = gfoe.hp
+		await _wait_seconds(6.0)
+		var ah: float = afoe.hp if is_instance_valid(afoe) else 0.0
+		var gh: float = gfoe.hp if is_instance_valid(gfoe) else 0.0
+		print("aatest: AA vs air %.0f -> %.0f (%s) | gun vs ground %.0f -> %.0f (%s)"
+			% [ah0, ah, "HIT" if ah < ah0 else "UNTOUCHED",
+				gh0, gh, "HIT" if gh < gh0 else "UNTOUCHED"])
+		rig.center_on((ab2.x + 11.0) * T, (ab2.y + 7.0) * T)
+		rig.dist = 26.0
+		rig.target_dist = 26.0
+		rig.cam.position = Vector3(0, 0, rig.dist)
+		if world._shroud_mi != null:
+			world._shroud_mi.visible = false
+		await _wait_seconds(0.3)
+
+	if args.has("--fordtest"):
+		# A ford that units quietly path AROUND is decoration, not a crossing —
+		# and a screenshot cannot tell the difference between wading across and
+		# detouring half the map. So: stand a tank on one bank, order it to the
+		# far bank, and check where it actually ends up.
+		var fx := -1
+		var fy := -1
+		for ty in range(world.h):
+			for tx in range(world.w):
+				if world.grid[ty][tx] == "f":
+					fx = tx
+					fy = ty
+					break
+			if fx != -1:
+				break
+		if fx == -1:
+			print("fordtest: no ford tiles on this map")
+		else:
+			var wx := fx
+			while wx > 2 and not world.is_walkable(wx - 1, fy):
+				wx -= 1
+			while wx > 2 and world.grid[fy][wx - 1] == "f":
+				wx -= 1
+			var ex := fx
+			while ex < world.w - 3 and world.grid[fy][ex + 1] in ["f", "~"]:
+				ex += 1
+			var from_t := Vector2i(maxi(2, wx - 6), fy)
+			var to_t := Vector2i(mini(world.w - 3, ex + 6), fy)
+			var fu := army.spawn("bastion", player_fac, from_t)
+			await _wait_seconds(0.5)
+			var start_p := fu.global_position
+			var goal := Vector3((to_t.x + 0.5) * T, 0.0, (to_t.y + 0.5) * T)
+			army.selection = [fu]
+			army.order_move(goal)
+			var crossed := false
+			for _i in range(140):        # ~14 s at 10 ticks/s of observation
+				await _wait_seconds(0.1)
+				var tx2 := int(fu.global_position.x / T)
+				var ty2 := int(fu.global_position.z / T)
+				if world.in_bounds(tx2, ty2) and world.grid[ty2][tx2] == "f":
+					crossed = true
+				if fu.global_position.distance_to(goal) < 3.0:
+					break
+			var d := fu.global_position.distance_to(goal)
+			print("fordtest: ford at (%d,%d) | from (%d,%d) to (%d,%d)"
+				% [fx, fy, from_t.x, from_t.y, to_t.x, to_t.y])
+			print("fordtest: travelled %.1f m | %.1f m short of the far bank | ON THE FORD: %s | %s"
+				% [start_p.distance_to(fu.global_position), d, crossed,
+					"CROSSED" if d < 3.0 else "DID NOT ARRIVE"])
+			rig.center_on(float(fx + 1) * T, float(fy) * T)
+			rig.dist = 34.0
+			rig.target_dist = 34.0
+			rig.cam.position = Vector3(0, 0, rig.dist)
+			if world._shroud_mi != null:
+				world._shroud_mi.visible = false
+			await _wait_seconds(0.4)
+
+	if args.has("--rollcall"):
+		# Facing was only ever verified on AIRCRAFT. The VEHICLE nose rule —
+		# "the thin end of the model is the gun barrel, so that end is the
+		# front" — was never checked against the vehicles it actually governs,
+		# and the Juggernaut and Hammerfall shipped driving backwards.
+		#
+		# One unit at a time, driven EAST (+X, which is screen RIGHT under this
+		# camera), framed to its own radius and photographed. A whole roster in
+		# one process, so the models can be judged from PICTURES rather than
+		# from the rule that produced them.
+		var rdir := "user://"
+		var ri := args.find("--rollcall")
+		if ri != -1 and ri + 1 < args.size():
+			rdir = String(args[ri + 1])
+		var rb: Vector2i = world.faction_start(player_fac)
+		var kinds: Array[String] = []
+		for k in EFArmy.KINDS.keys():
+			if ResourceLoader.exists("res://models/unit_%s.glb" % k):
+				kinds.append(String(k))
+		kinds.sort()
+		if world._shroud_mi != null:
+			world._shroud_mi.visible = false
+		for k in kinds:
+			# Do NOT drive them. Driving made the shot depend on pathfinding,
+			# and pathfinding promptly routed half the roster around obstacles
+			# heading south — the direction under test became a variable. The
+			# question is only ever "does the mesh's nose agree with the unit's
+			# own forward vector", so the transform is SET and photographed.
+			# well clear of the base: the start forces are the SAME faction
+			# colour and stood in frame, wrecking any automatic "where is the
+			# subject" measurement taken off the screenshot
+			var ru := army.spawn(k, player_fac, rb + Vector2i(30, 26))
+			await _wait_seconds(1.6)         # let a flyer reach cruise altitude
+			# Aim at the MODEL, not the ground point under it. center_on takes a
+			# ground target, so a tall hull renders above frame centre and an
+			# aircraft at altitude leaves the shot entirely — which is what made
+			# the first contact sheet half empty sky. At the rig's ~52 degree
+			# pitch, pushing the aim south by altitude/tan(52) re-centres it.
+			# NORTH, not south: moving the aim point south puts the subject
+			# north of centre, which pushes it UP and off the top of frame —
+			# the mistake that emptied the first two contact sheets.
+			var ralt: float = ru.global_position.y + maxf(ru.radius, 0.5) * 0.8
+			rig.center_on(ru.global_position.x,
+				ru.global_position.z - ralt * 0.78)
+			# an aircraft cruises 8 m up, so it is 8 m NEARER the camera than the
+			# ground plane this distance was sized against — without the
+			# altitude term every flyer filled the whole frame
+			var rd: float = clampf(ru.radius * 13.0, 11.0, 30.0) \
+				+ ru.global_position.y * 1.35
+			rig.dist = rd
+			rig.target_dist = rd
+			rig.cam.position = Vector3(0, 0, rd)
+			await _wait_seconds(0.25)
+			# Face EAST on the frame we photograph. Basis(UP, -90 deg) maps the
+			# engine's forward (-Z) onto +X, so every model in the sheet is
+			# nose-east by construction and the sheet can be read with one rule:
+			# the nose must point SCREEN RIGHT.
+			ru.global_transform.basis = Basis(Vector3.UP, -PI / 2.0)
+			await RenderingServer.frame_post_draw
+			get_viewport().get_texture().get_image().save_png(
+				"%s/rc_%s.png" % [rdir, k])
+			var rf := -ru.global_transform.basis.z
+			print("rollcall: %-14s fwd (%+.2f, %+.2f) dist %.0f alt %.2f"
+				% [k, rf.x, rf.z, rd, ru.global_position.y])
+			army.selection = []
+			army.units.erase(ru)
+			ru.queue_free()
+			await _wait_seconds(0.15)
+		print("rollcall: %d models photographed | EAST = SCREEN RIGHT" % kinds.size())
+
+	if args.has("--airfacing"):
+		# A model reversed INSIDE its own glb is invisible to every transform
+		# test: --facing compares the hull basis to velocity and the two agree
+		# by construction, because the code is steering correctly and only the
+		# MESH is wrong. The only proof is a picture. Fly it east — +X, which
+		# is SCREEN RIGHT under this camera — and look at where the nose points.
+		var ab: Vector2i = world.faction_start(player_fac)
+		var akind := "sparrowhawk"
+		var qa := args.find("--pick")
+		if qa != -1 and qa + 1 < args.size():
+			akind = String(args[qa + 1])
+		var au := army.spawn(akind, player_fac, ab + Vector2i(6, 12))
+		await _wait_seconds(0.8)
+		army.selection = [au]
+		# Bounded to the map: the first pass ordered a 60-tile hop, a 15 m/s
+		# Sparrowhawk crossed the edge, and the camera's own _clamp() then
+		# refused to follow it — the framing loop converged in Y and sat 237 px
+		# out in X because the target was somewhere it could never look.
+		var adx: float = minf(ab.x + 44.0, world.w - 7.0)
+		army.order_move(Vector3(adx * T, 0.0, (ab.y + 12.0) * T))
+		await _wait_seconds(2.2)
+		var av := au.vel
+		av.y = 0.0
+		var afwd := -au.global_transform.basis.z
+		print("airfacing: %-12s vel (%+.2f, %+.2f) basis-fwd (%+.2f, %+.2f) | EAST = SCREEN RIGHT"
+			% [akind, av.x, av.z, afwd.x, afwd.z])
+		# Framing this by dead reckoning does not work: the aircraft flies at
+		# altitude, which throws it toward the TOP of the frame, and a 15 m/s
+		# Sparrowhawk outruns any fixed lead (the first attempt photographed
+		# empty ground). Close the loop instead — unproject where it ACTUALLY
+		# lands and nudge the rig until it sits in the middle of the playable
+		# area. Note the sidebar eats the right ~220 px, so the aim point is
+		# not the frame centre. The loop also tracks the aircraft, so it is
+		# still framed on the last iteration before the shot.
+		rig.dist = 22.0
+		rig.target_dist = 22.0
+		rig.cam.position = Vector3(0, 0, rig.dist)
+		if world._shroud_mi != null:
+			world._shroud_mi.visible = false
+		var vps := get_viewport().get_visible_rect().size
+		var want := Vector2((vps.x - 220.0) * 0.5, vps.y * 0.5)
+		rig.center_on(au.global_position.x, au.global_position.z)
+		var sp := Vector2.ZERO
+		for i in range(16):
+			await _wait_seconds(0.05)
+			sp = rig.cam.unproject_position(au.global_position)
+			var err := sp - want
+			if args.has("--dump"):
+				print("  frame %d: plane (%.1f, %.1f) rig (%.1f, %.1f) screen (%.0f, %.0f) err (%+.0f, %+.0f) yaw %.1f map %dx%d"
+					% [i, au.global_position.x, au.global_position.z,
+						rig.position.x, rig.position.z, sp.x, sp.y,
+						err.x, err.y, rad_to_deg(rig.rotation.y), world.w, world.h])
+			if err.length() < 14.0:
+				break
+			# Separate gains per axis, and BOTH below critical. One shared 0.035
+			# made X oscillate with GROWING amplitude (146 -> 170 -> 189 -> ...
+			# -> 266 px) while Y settled, because a 52-degree pitch foreshortens
+			# the ground: measured off the trace, 1 px is 0.0202 m along X but
+			# 0.0274 m along Z, so a gain tuned for Z over-corrects X by 1.75x.
+			# Damped to ~0.85 of measured, plus a feed-forward on the aircraft's
+			# own velocity so a 15 m/s Sparrowhawk does not out-run the loop.
+			# These are tied to rig.dist = 22 above.
+			var fv := au.vel
+			rig.center_on(rig.position.x + err.x * 0.017 + fv.x * 0.05,
+				rig.position.z + err.y * 0.023 + fv.z * 0.05)
+		_shot_subject = au        # hand it to the shutter tracker
+		print("airfacing: framed at screen (%.0f, %.0f), aim (%.0f, %.0f)"
+			% [sp.x, sp.y, want.x, want.y])
+
+	if args.has("--newtank"):
+		# the pipeline pilot: new per-kind Bastion beside the old shared-chassis
+		# tank (warpig still uses unit_tank.glb), same camera
+		var nt: Vector2i = world.faction_start(player_fac)
+		var nb := army.spawn("bastion", player_fac, nt + Vector2i(5, 5))
+		var ow := army.spawn("warpig", player_fac, nt + Vector2i(8, 5))
+		await _wait_seconds(1.0)
+		print("newtank: bastion custom_model=%s | warpig custom_model=%s (must be true/false)"
+			% [nb.custom_model, ow.custom_model])
+		var mi_n := 0
+		for c in nb.find_children("*", "MeshInstance3D", true, false):
+			var cmi := c as MeshInstance3D
+			if cmi.mesh == null:
+				continue
+			mi_n += 1
+			var mats: Array = []
+			for si in range(cmi.mesh.get_surface_count()):
+				var m := cmi.mesh.surface_get_material(si)
+				var ov := cmi.material_override
+				mats.append("%s%s" % [m.resource_name if m else "null",
+					"(+override)" if ov else ""])
+			print("newtank:   node '%s' surfaces=%d mats=%s"
+				% [cmi.name, cmi.mesh.get_surface_count(), mats])
+		print("newtank: bastion mesh nodes=%d (baked: expect 1-2)" % mi_n)
+		rig.center_on((nt.x + 6.5) * T, (nt.y + 5.5) * T)
+		rig.target_dist = 14.0
+		rig.dist = 14.0
+		# the harness disables rig._process, and dist only reaches the camera
+		# inside _process — write the camera transform directly or the shot
+		# stays at default zoom (the escort-test lesson, one layer deeper)
+		rig.cam.position = Vector3(0, 0, 14.0)
+		await _wait_seconds(0.5)
+
+	if args.has("--squadzoom"):
+		# The check I owed: do six-man sections still read as a checkerboard at
+		# the distance the game is actually played from?
+		var sz: Vector2i = world.faction_start(player_fac)
+		# each banner's own rifleman, not Karvath's — this flag now doubles as
+		# the uniform check (helmet accent, dark boots) for all four factions
+		var inf_kind: String = {1: "iron_guard", 2: "conscript",
+			3: "sky_marine", 4: "arc_templar"}.get(player_fac, "iron_guard")
+		var squads: Array[EFUnit] = []
+		for r in range(3):
+			for c in range(4):
+				squads.append(army.spawn(inf_kind, player_fac,
+					sz + Vector2i(4 + c * 3, 4 + r * 3)))
+		await _wait_seconds(1.2)
+		# converge everyone on one point: the huddle complaint is about squads
+		# ON THE MARCH, and spawn-grid spacing proves nothing about that
+		army.selection = squads.duplicate()
+		army.order_move(Vector3((sz.x + 8.5) * T, 0.0, (sz.y + 7.5) * T))
+		await _wait_seconds(3.5)
+		var cx2 := (sz.x + 8.5) * T
+		var cz2 := (sz.y + 7.5) * T
+		rig.center_on(cx2, cz2)
+		rig.target_dist = 30.0            # the default play distance
+		rig.dist = 30.0
+		await _wait_seconds(0.6)
+		# measure how scattered the men actually are: the standard deviation of
+		# their offsets tells me whether the jitter broke the rows or not
+		var xs: Array[float] = []
+		var zs: Array[float] = []
+		for u in squads:
+			for j in u._squad_jitter:
+				xs.append(j.x)
+				zs.append(j.z)
+		var mx := 0.0
+		for v in xs:
+			mx += absf(v)
+		print("squadzoom: %d sections, mean |jitter| = %.3f m against 0.30 m spacing"
+			% [squads.size(), mx / maxf(float(xs.size()), 1.0)])
+		print("squadzoom: camera at %.0f m — this is the distance the player sees"
+			% rig.dist)
+
+	if args.has("--meshdump"):
+		# Observation, not theory: compare what the BAKED mesh's surfaces hold
+		# against the same materials read straight off the un-baked glb.
+		var raw: Node3D = (load("res://models/unit_soldier.glb") as PackedScene).instantiate()
+		add_child(raw)
+		print("meshdump: --- materials ON THE GLB (these render correctly) ---")
+		var seen_raw := {}
+		for child in raw.find_children("*", "MeshInstance3D", true, false):
+			var rmi := child as MeshInstance3D
+			if rmi.mesh == null:
+				continue
+			for si in range(rmi.mesh.get_surface_count()):
+				var rm := rmi.get_active_material(si)
+				if rm == null or seen_raw.has(rm.get_instance_id()):
+					continue
+				seen_raw[rm.get_instance_id()] = true
+				var tex_r := "none"
+				if rm is BaseMaterial3D:
+					var t: Texture2D = (rm as BaseMaterial3D).albedo_texture
+					tex_r = "null" if t == null else "%s(%dx%d)" % [
+						t.get_class(), t.get_width(), t.get_height()]
+				print("  glb mat '%s' class=%s albedo_tex=%s"
+					% [rm.resource_name, rm.get_class(), tex_r])
+		raw.queue_free()
+
+		print("meshdump: --- surfaces ON THE BAKED MESH (these checkerboard) ---")
+		EFUnit.reset_visual_caches()
+		var baked: ArrayMesh = EFUnit._bake_squad_mesh(player_fac, "")
+		if baked == null:
+			print("  BAKE RETURNED NULL")
+		else:
+			print("  surfaces=%d" % baked.get_surface_count())
+			for i in range(baked.get_surface_count()):
+				var bm := baked.surface_get_material(i)
+				var desc := "NULL MATERIAL"
+				if bm != null:
+					var tex_b := "n/a"
+					if bm is BaseMaterial3D:
+						var bt: Texture2D = (bm as BaseMaterial3D).albedo_texture
+						tex_b = "null" if bt == null else "%s(%dx%d)" % [
+							bt.get_class(), bt.get_width(), bt.get_height()]
+						tex_b += " shaded=%d" % (bm as BaseMaterial3D).shading_mode
+					desc = "'%s' class=%s albedo_tex=%s" % [
+						bm.resource_name, bm.get_class(), tex_b]
+				# what the geometry itself carries
+				var arr: Array = baked.surface_get_arrays(i)
+				var verts: int = (arr[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
+				var has_norm: bool = arr[Mesh.ARRAY_NORMAL] != null
+				var has_tan: bool = arr[Mesh.ARRAY_TANGENT] != null
+				var has_uv: bool = arr[Mesh.ARRAY_TEX_UV] != null
+				var has_col: bool = arr[Mesh.ARRAY_COLOR] != null
+				print("  surf %d: %s" % [i, desc])
+				print("          verts=%d normal=%s tangent=%s uv=%s color=%s"
+					% [verts, has_norm, has_tan, has_uv, has_col])
+		# ISOLATION: the SAME baked mesh rendered three ways, side by side.
+		# Whichever one checkerboards is the culprit, and it is no longer a guess.
+		if baked != null:
+			var s0: Vector2i = world.faction_start(player_fac)
+			var base := Vector3((s0.x + 6.5) * T, 0, (s0.y + 6.5) * T)
+
+			# (a) plain MeshInstance3D — no MultiMesh at all
+			var plain := MeshInstance3D.new()
+			plain.mesh = baked
+			plain.position = base
+			plain.scale = Vector3(3, 3, 3)
+			add_child(plain)
+
+			# (b) MultiMesh with colours + custom data, exactly as the squad does
+			var mmA := MultiMesh.new()
+			mmA.transform_format = MultiMesh.TRANSFORM_3D
+			mmA.use_colors = true
+			mmA.use_custom_data = true
+			mmA.mesh = baked
+			mmA.instance_count = 1
+			mmA.set_instance_transform(0, Transform3D(Basis().scaled(Vector3(3, 3, 3)),
+				base + Vector3(4, 0, 0)))
+			mmA.set_instance_color(0, Color(1, 1, 1, 1))
+			mmA.set_instance_custom_data(0, Color(0, 0, 0, 0))
+			var miA := MultiMeshInstance3D.new()
+			miA.multimesh = mmA
+			add_child(miA)
+
+			# (c) MultiMesh with NEITHER colours nor custom data
+			var mmB := MultiMesh.new()
+			mmB.transform_format = MultiMesh.TRANSFORM_3D
+			mmB.mesh = baked
+			mmB.instance_count = 1
+			mmB.set_instance_transform(0, Transform3D(Basis().scaled(Vector3(3, 3, 3)),
+				base + Vector3(8, 0, 0)))
+			var miB := MultiMeshInstance3D.new()
+			miB.multimesh = mmB
+			add_child(miB)
+
+			print("meshdump: left=plain MeshInstance | middle=MultiMesh+colors+custom | right=MultiMesh bare")
+			rig.center_on(base.x + 4.0, base.z)
+			rig.target_dist = 16.0
+			rig.dist = 16.0
+			await _wait_seconds(0.6)
+		print("meshdump: done")
+
+	if args.has("--battle"):
+		# Every other timing window measures a quiet base. The frame cost that
+		# actually matters is 40v40 shooting, where the effect code allocates.
+		var sb: Vector2i = world.faction_start(player_fac)
+		var mid := Vector2i(sb.x + 14, sb.y + 14)
+		var mine: Array[EFUnit] = []
+		var theirs: Array[EFUnit] = []
+		for i in range(40):
+			mine.append(army.spawn(["iron_guard", "bastion", "outrider"][i % 3],
+				player_fac, mid + Vector2i(-6 + (i % 6), -6 + (i / 6))))
+			theirs.append(army.spawn(["conscript", "warpig", "rat"][i % 3],
+				ai_fac, mid + Vector2i(4 + (i % 6), 4 + (i / 6))))
+		await _wait_seconds(1.0)
+		army.selection = mine
+		army.order_move(Vector3((mid.x + 6.5) * T, 0, (mid.y + 6.5) * T))
+		# wait for the shooting to actually start before timing anything
+		await _wait_until(func():
+			for u in mine:
+				if is_instance_valid(u) and u.tgt_unit != null:
+					return true
+			return false, 30.0)
+		await _wait_seconds(1.5)
+		var t0 := Time.get_ticks_usec()
+		var frames := 0
+		while frames < 120:
+			await get_tree().process_frame
+			frames += 1
+		var dur := float(Time.get_ticks_usec() - t0) / 1000000.0
+		var alive_a := 0
+		var alive_b := 0
+		for u in mine:
+			if is_instance_valid(u) and u.hp > 0:
+				alive_a += 1
+		for u in theirs:
+			if is_instance_valid(u) and u.hp > 0:
+				alive_b += 1
+		print("battle: %d v %d fighting | %.1f FPS over %d frames IN COMBAT"
+			% [alive_a, alive_b, float(frames) / maxf(dur, 0.001), frames])
+		print("battle: draw calls=%d | fx nodes=%d"
+			% [RenderingServer.get_rendering_info(
+				RenderingServer.RENDERING_INFO_TOTAL_DRAW_CALLS_IN_FRAME),
+				army.get_child_count()])
+		# smoke: every puff on the map should now cost ONE draw call between them
+		var live_puffs := 0
+		for s in army._puffs:
+			if bool(s["live"]):
+				live_puffs += 1
+		print("battle: %d puffs of smoke alive, sharing %d MultiMesh (pool %d)"
+			% [live_puffs, 1 if army._puff_mm != null else 0, EFArmy.PUFF_POOL])
+		rig.center_on((mid.x + 0.5) * T, (mid.y + 0.5) * T)
+		rig.target_dist = 30.0
+		rig.dist = 30.0
+
+	if args.has("--expand"):
+		# A BRUTAL commander should not sit on one deposit all game. Compress the
+		# clock so a 3-minute-plus behaviour is observable in a selftest.
+		var brain: EFAI = null
+		for a in ais:
+			if a.fac == ai_fac:
+				brain = a
+		if brain == null:
+			print("expand: NO AI FOUND")
+		else:
+			brain.set_difficulty(3)
+			brain.expand_after = 8.0          # compressed from 180s
+			brain.expand_credits = 1500
+			brain.expand_army = 1
+			economy.credits[ai_fac] = 12000   # give it the means, not the decision
+			print("expand: fields clustered on this map=%d | expand_max=%d reach=%d"
+				% [brain._fields.size(), brain.expand_max, brain.expand_reach])
+			var posts0 := buildings.count_posts(ai_fac)
+			var won := await _wait_until(func():
+				return buildings.count_posts(ai_fac) > posts0, 150.0)
+			var posts1 := buildings.count_posts(ai_fac)
+			print("expand: posts %d -> %d within 150s (must grow) state=%s built=%d"
+				% [posts0, posts1, brain._exp_state, brain._exp_built])
+			# where did it plant it, and is it actually near ember?
+			var far := 0
+			var near_ember := false
+			for b in buildings.list:
+				if b["type"] == "command_post" and b["faction"] == ai_fac \
+						and b["hp"] > 0:
+					var o: Vector2i = b["origin"]
+					var d := maxi(absi(o.x - brain.hq_tile.x), absi(o.y - brain.hq_tile.y))
+					far = maxi(far, d)
+					for t in world.ember_tiles:
+						if maxi(absi(t.x - o.x), absi(t.y - o.y)) <= 8:
+							near_ember = true
+			print("expand: furthest post is %d tiles from the capital (spacing min %d)"
+				% [far, EFBuildings.MCV_SPACING])
+			print("expand: a post sits within 8 tiles of ember=%s (that is the point)"
+				% near_ember)
+			print("expand: reached=%s" % won)
+
+	if args.has("--escort"):
+		# The harness switches the rig's _process OFF above so screenshots are
+		# deterministic — which also switches off the escort camera. Measuring
+		# the follow with it disabled reported the feature as broken when it was
+		# the test that was broken. Turn it back on for this one test.
+		rig.set_process(true)
+		rig.edge_pan_on = false
+		var se: Vector2i = world.faction_start(player_fac)
+		var fast := army.spawn("outrider", player_fac, se + Vector2i(4, 4))
+		var slow := army.spawn("bastion", player_fac, se + Vector2i(5, 4))
+		await _wait_seconds(0.5)
+		rig.follow_on = true
+		army.selection = [fast, slow]
+		var cam0 := Vector2(rig.position.x, rig.position.z)
+		var dest := Vector3((se.x + 30.5) * T, 0, (se.y + 4.5) * T)
+		army.order_move(dest)
+		rig.follow_group(army.selection)
+		print("escort: after follow_group active=%s units=%d follow_on=%s"
+			% [rig._follow_active, rig.follow_units.size(), rig.follow_on])
+		print("escort: rig processing=%s (must be true or nothing can follow)"
+			% rig.is_processing())
+		await _wait_seconds(1.0)
+		print("escort: 1s later active=%s cam=(%.1f,%.1f) fast at (%.1f,%.1f)"
+			% [rig._follow_active, rig.position.x, rig.position.z,
+				fast.global_position.x, fast.global_position.z])
+		await _wait_seconds(3.0)
+		var cam1 := Vector2(rig.position.x, rig.position.z)
+		var fastp := Vector2(fast.global_position.x, fast.global_position.z)
+		var slowp := Vector2(slow.global_position.x, slow.global_position.z)
+		print("escort: camera moved %.1f m with the group (must be > 5)"
+			% cam0.distance_to(cam1))
+		print("escort: camera is %.1f m from the fast unit, %.1f m from the slow one (must favour the fast)"
+			% [cam1.distance_to(fastp), cam1.distance_to(slowp)])
+		# the release: a manual pan must hand control straight back
+		var before := Vector2(rig.position.x, rig.position.z)
+		rig.release_follow()
+		await _wait_seconds(2.0)
+		var after := Vector2(rig.position.x, rig.position.z)
+		print("escort: after release the camera moved %.2f m while the group kept marching (must be ~0)"
+			% before.distance_to(after))
+		# and clicking off the units must release it too
+		rig.follow_group(army.selection)
+		army.clear_selection()
+		print("escort: deselecting released the follow=%s (must be true)"
+			% [not rig._follow_active])
+		rig.follow_on = false
+
+	if args.has("--walk"):
+		# the gait must be driven by GROUND COVERED, not by time, or the feet
+		# skate; and it must actually reach the shader as custom data
+		var sw: Vector2i = world.faction_start(player_fac)
+		var sol := army.spawn("iron_guard", player_fac, sw + Vector2i(5, 5))
+		await _wait_seconds(0.6)
+		var mmw: MultiMesh = sol._squad_mm.multimesh
+		print("walk: custom data enabled=%s | colours=%s | instances=%d"
+			% [mmw.use_custom_data, mmw.use_colors, mmw.instance_count])
+		# limb tagging: how many of the baked verts are legs vs arms vs body
+		var bm: ArrayMesh = mmw.mesh
+		var tally := {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
+		for si in range(bm.get_surface_count()):
+			var arr := bm.surface_get_arrays(si)
+			if arr[Mesh.ARRAY_TEX_UV2] == null:
+				continue
+			var u2: PackedVector2Array = arr[Mesh.ARRAY_TEX_UV2]
+			for v in u2:
+				var lid := int(round(v.x))
+				tally[lid] = int(tally.get(lid, 0)) + 1
+		print("walk: limb tags body=%d Lleg=%d Rleg=%d Larm=%d Rarm=%d (legs+arms must be > 0)"
+			% [tally[0], tally[1], tally[2], tally[3], tally[4]])
+		# stand still: gait must settle to zero
+		await _wait_seconds(1.4)
+		var idle_amt: float = mmw.get_instance_custom_data(0).g
+		# now march and sample the phase twice
+		army.selection = [sol]
+		army.order_move(Vector3((sw.x + 22.5) * T, 0, (sw.y + 5.5) * T))
+		await _wait_seconds(1.2)
+		var p1: float = mmw.get_instance_custom_data(0).r
+		var amt1: float = mmw.get_instance_custom_data(0).g
+		var pos1 := sol.global_position
+		await _wait_seconds(1.2)
+		var p2: float = mmw.get_instance_custom_data(0).r
+		var dist := sol.global_position.distance_to(pos1)
+		print("walk: idle gait amount %.2f (must be ~0) -> walking %.2f (must be ~1)"
+			% [idle_amt, amt1])
+		print("walk: phase advanced %.2f rad over %.2f m travelled -> %.2f rad/m (stride %.2f m)"
+			% [fposmod(p2 - p1, TAU), dist,
+				fposmod(p2 - p1, TAU) / maxf(dist, 0.001), EFUnit.STRIDE_LEN])
+		# six men, each on his own phase, so a section is not one animal
+		var phases: Array = []
+		for i in range(6):
+			phases.append("%.2f" % mmw.get_instance_custom_data(i).r)
+		print("walk: per-man phases %s (must differ)" % [phases])
+		# report what the bake actually produced, per surface
+		for si2 in range(bm.get_surface_count()):
+			var a2 := bm.surface_get_arrays(si2)
+			var vv: PackedVector3Array = a2[Mesh.ARRAY_VERTEX]
+			var mn := Vector3(1e9, 1e9, 1e9)
+			var mx := Vector3(-1e9, -1e9, -1e9)
+			for v3 in vv:
+				mn = Vector3(minf(mn.x, v3.x), minf(mn.y, v3.y), minf(mn.z, v3.z))
+				mx = Vector3(maxf(mx.x, v3.x), maxf(mx.y, v3.y), maxf(mx.z, v3.z))
+			var mt := bm.surface_get_material(si2)
+			print("walk: surf %d verts=%d normals=%s uv=%s bounds y %.2f..%.2f mat=%s"
+				% [si2, vv.size(), a2[Mesh.ARRAY_NORMAL] != null,
+					a2[Mesh.ARRAY_TEX_UV] != null, mn.y, mx.y,
+					mt.get_class() if mt != null else "NULL"])
+		rig.center_on(sol.global_position.x, sol.global_position.z)
+		rig.target_dist = 6.0
+		rig.dist = 6.0
+		await _wait_seconds(0.6)
 
 	if args.has("--wide"):
 		# the Juggernaut is 1.5 m of radius on a 2 m grid: the ordinary A* grid
@@ -2233,6 +4040,19 @@ func _run_selftest(path: String) -> void:
 		print("audio: deployment sound resolves for %d/%d kinds, unresolved %s"
 			% [EFArmy.KINDS.size() - unresolved.size(), EFArmy.KINDS.size(),
 				unresolved if not unresolved.is_empty() else "none"])
+		var ann_missing: Array = []
+		for f2 in range(1, 5):
+			for ev in EFAudio.ANN_EVENTS:
+				if not ResourceLoader.exists("res://sounds/ann/f%d_%s.wav" % [f2, ev]):
+					ann_missing.append("f%d_%s" % [f2, ev])
+		var ann_total: int = 4 * EFAudio.ANN_EVENTS.size()
+		print("audio: announcer %d/%d lines present, missing %s"
+			% [ann_total - ann_missing.size(), ann_total,
+				ann_missing if not ann_missing.is_empty() else "none"])
+		audio.announce("construction", true)
+		await _wait_seconds(0.6)
+		print("audio: announcer speaking=%s (faction %d voice)"
+			% [audio._ann_player != null and audio._ann_player.playing, player_fac])
 		# the anthem: play it, confirm the stems duck without their transports
 		# being touched (that is what keeps the 96 BPM grid locked)
 		var bed_pos0: float = music.bed.get_playback_position()
@@ -2907,15 +4727,40 @@ func _run_selftest(path: String) -> void:
 	print("econ: P1 %d cr | P2 %d cr | %d cr still in the ground" %
 		[economy.credits.get(1, 0), economy.credits.get(2, 0), economy.total_reserves()])
 
+	# A selftest that photographs a MOVING subject has to hold it in frame right
+	# up to the shutter: this routine waits 120 frames before it shoots, and a
+	# 15 m/s Sparrowhawk covers ~30 m in that window — every early --airfacing
+	# shot came back as empty ground with the aircraft long gone.
 	for i in range(30):
 		await get_tree().process_frame
+		_track_shot_subject()
 	var t0 := Time.get_ticks_msec()
 	for i in range(90):
 		await get_tree().process_frame
+		_track_shot_subject()
 	var avg_fps := 90000.0 / maxf(1.0, float(Time.get_ticks_msec() - t0))
 	print("selftest avg fps over 90 frames: %.1f" % avg_fps)
 	await RenderingServer.frame_post_draw
 	var img := get_viewport().get_texture().get_image()
 	img.save_png(path)
+	if OS.get_cmdline_user_args().has("--newtank"):
+		print("newtank: AT SCREENSHOT cam.position=%s rig.dist=%.1f rig.position=(%.1f, %.1f)"
+			% [rig.cam.position, rig.dist, rig.position.x, rig.position.z])
 	print("selftest screenshot -> ", path)
 	get_tree().quit()
+
+
+var _shot_subject: EFUnit = null      # kept in frame until the shutter
+
+
+func _track_shot_subject() -> void:
+	if _shot_subject == null or not is_instance_valid(_shot_subject):
+		return
+	var vps := get_viewport().get_visible_rect().size
+	var want := Vector2((vps.x - 220.0) * 0.5, vps.y * 0.5)
+	var err := rig.cam.unproject_position(_shot_subject.global_position) - want
+	# same per-axis gains as the acquisition loop — one shared gain oscillates
+	# in X — with the feed-forward stepped down to a single frame's worth
+	var fv: Vector3 = _shot_subject.vel
+	rig.center_on(rig.position.x + err.x * 0.017 + fv.x * 0.0167,
+		rig.position.z + err.y * 0.023 + fv.z * 0.0167)

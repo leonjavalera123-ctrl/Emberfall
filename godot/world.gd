@@ -16,6 +16,11 @@ const TILE_DEFS := {
 	",": {"name": "Cratered Rough",   "walk": true,  "build": false},
 	"#": {"name": "Rock & Ruin",      "walk": false, "build": false},
 	"~": {"name": "Flooded Trench",   "walk": false, "build": false},
+	# A river that cannot be crossed cuts a map in half and strands half the
+	# pathfinding. Fords are the crossings: the water reads as continuous from
+	# above, but the bed is raised and the surface sits shallow, so ground units
+	# wade through instead of walking around the world.
+	"f": {"name": "Ford",             "walk": true,  "build": false},
 	"E": {"name": "Emberstone Field", "walk": true,  "build": false},
 	"B": {"name": "Ruined Structure", "walk": false, "build": false},
 	"R": {"name": "Refinery",         "walk": false, "build": false},
@@ -23,12 +28,71 @@ const TILE_DEFS := {
 	"W": {"name": "Iron Wall",        "walk": false, "build": false},
 }
 
+# THREE colours per banner, because one was doing two incompatible jobs.
+#
+# "color" is the TEAM colour: minimap blips, health bars, selection rings, the
+# flag on a wing. That job wants saturation and separation, so it keeps the
+# bright values the UI has always used.
+#
+# "hull" and "accent" are what the ARMOUR is actually painted. These were
+# measured off the Higgsfield concept art with k-means over the subject pixels
+# (background and contact shadow masked out), then brightened ~1.4x, because a
+# sampled pixel is a SHADED result and albedo has to survive being multiplied
+# by sunlight and baked AO on the way back down. Painting the bright team
+# colour across a whole hull is what made the army read as flat toys: the
+# concepts are dark, desaturated armour carrying one bright metal accent, and
+# the accent had nowhere to live because every faction shared Blender's grey.
+#
+# Measured dominant hull clusters, for anyone re-tuning these:
+#   Karvath rgb(85,50,46) · Ashfall rgb(102,87,69)
+#   Aurelia rgb(48,54,70) · Luminar rgb(215,212,215) + violet rgb(67,59,80)
+# The armour colours are chosen against the TERRAIN, not in isolation. Sampled
+# ground albedo is rgb(108,83,57) at L*37 — a warm mid-brown — and the first
+# concept-faithful pass put Karvath at deltaE 14.4 and Ashfall at 13.9 from it.
+# Both were near-camouflaged: faithful to the art, unreadable in play. A unit
+# the player cannot pick off the ground is a worse failure than a unit whose
+# paint is a shade off its concept, so these sit at the closest point to the art
+# that still clears deltaE 26 from terrain and 30 from every other banner.
+#
+# Ashfall drifts furthest and does so knowingly. Its art is warm khaki-brown,
+# which is precisely the ground's own hue; the olive it wears here is the only
+# direction with anywhere to go.
 const FACTIONS := {
-	1: {"name": "KARVATH", "color": Color(0.72, 0.25, 0.18)},
-	2: {"name": "ASHFALL", "color": Color(0.5, 0.52, 0.3)},
-	3: {"name": "AURELIA", "color": Color(0.28, 0.52, 0.73)},
-	4: {"name": "LUMINAR", "color": Color(0.66, 0.51, 0.88)},
+	1: {"name": "KARVATH", "color": Color(0.72, 0.25, 0.18),
+		# deeper and more saturated than the sampled oxide: red holds its
+		# identity while pulling away from the brown it used to sink into
+		"hull": Color(0.48, 0.18, 0.15),          # terrain ~28
+		# dark iron, not bright steel. At deltaE 46 from the hull the old
+		# polished trim read as white specks of chipped paint, because the
+		# crease pattern it follows is blotchy and high contrast advertises
+		# that. Pulling it to ~35 lets it read as fittings on a red hull.
+		"accent": Color(0.45, 0.42, 0.38), "acc_metal": 0.80, "acc_rough": 0.45},
+	2: {"name": "ASHFALL", "color": Color(0.5, 0.52, 0.3),
+		"hull": Color(0.46, 0.50, 0.26),          # terrain 27.8
+		"accent": Color(0.46, 0.30, 0.18), "acc_metal": 0.55, "acc_rough": 0.78},
+	3: {"name": "AURELIA", "color": Color(0.28, 0.52, 0.73),
+		"hull": Color(0.26, 0.31, 0.42),          # terrain 37.8, the signature navy
+		"accent": Color(0.80, 0.66, 0.34), "acc_metal": 0.95, "acc_rough": 0.30},
+	# Luminar was asked to go darker, and darkening a violet-GREY walks it
+	# straight into Aurelia's navy — the two sat only deltaE 13 apart, close
+	# enough to confuse mid-battle. Saturating instead of dulling buys the
+	# darkness for free: L* drops 57 -> 37 while separation from navy RISES to
+	# 42.6. The art's white enamel does not vanish, it swaps roles and becomes
+	# the trim, so both concept colours are still on the model.
+	4: {"name": "LUMINAR", "color": Color(0.47, 0.31, 0.74),
+		"hull": Color(0.42, 0.23, 0.54),          # terrain 62.6, navy 38.1
+		# near-white on violet was the worst offender of all: at deltaE 67 the
+		# trim read as snow or battle damage rather than enamel. Softened to a
+		# pale silver-violet that still catches the light.
+		"accent": Color(0.70, 0.66, 0.80), "acc_metal": 0.55, "acc_rough": 0.28},
 }
+
+
+# Units and buildings paint themselves with the armour colour; everything that
+# exists to be READ at a glance keeps the saturated team colour.
+static func hull_of(fac: int) -> Color:
+	var f: Dictionary = FACTIONS.get(fac, FACTIONS[1])
+	return f.get("hull", f["color"])
 
 var grid: Array[String] = []      # one String per row; row[x] is the tile char
 var starts := {}                  # start number -> Vector2i tile
@@ -288,21 +352,42 @@ func _noisy_mat(dark: Color, light: Color, scale: float = 0.14) -> StandardMater
 	return m
 
 
-func _pbr_mat(base: String, tint: Color, scale: float) -> StandardMaterial3D:
+func _pbr_mat(base: String, tint: Color, scale: float, macro := 0.45) -> Material:
 	var diff := "res://textures/%s_Diffuse.jpg" % base
 	if not ResourceLoader.exists(diff):
 		return null
+	# the ground shader: planar XZ at a third of triplanar's fetches, plus the
+	# 1/7th-frequency macro layer that breaks the visible tile repeat. `macro`
+	# must shrink as the BASE frequency drops: on the mud (uv 0.14) the macro
+	# resample lands at a ~50 m period and paints giant blotches instead of
+	# breaking tiling — observed as a huge checkerboard across the trench.
+	var sh := load("res://ground.gdshader") as Shader
+	if sh != null:
+		var sm := ShaderMaterial.new()
+		sm.shader = sh
+		sm.set_shader_parameter("albedo_tex", load(diff))
+		sm.set_shader_parameter("tint", tint)
+		sm.set_shader_parameter("uv_scale", scale)
+		sm.set_shader_parameter("macro_amount", macro)
+		var norp := "res://textures/%s_nor_gl.jpg" % base
+		if ResourceLoader.exists(norp):
+			sm.set_shader_parameter("normal_tex", load(norp))
+		var rgp := "res://textures/%s_Rough.jpg" % base
+		if ResourceLoader.exists(rgp):
+			sm.set_shader_parameter("rough_tex", load(rgp))
+		return sm
+	# fallback: the old triplanar StandardMaterial3D, kept for safety
 	var m := StandardMaterial3D.new()
 	m.albedo_texture = load(diff)
 	m.albedo_color = tint
-	var norp := "res://textures/%s_nor_gl.jpg" % base
-	if ResourceLoader.exists(norp):
+	var norp2 := "res://textures/%s_nor_gl.jpg" % base
+	if ResourceLoader.exists(norp2):
 		m.normal_enabled = true
-		m.normal_texture = load(norp)
+		m.normal_texture = load(norp2)
 		m.normal_scale = 0.6
-	var rgp := "res://textures/%s_Rough.jpg" % base
-	if ResourceLoader.exists(rgp):
-		m.roughness_texture = load(rgp)
+	var rgp2 := "res://textures/%s_Rough.jpg" % base
+	if ResourceLoader.exists(rgp2):
+		m.roughness_texture = load(rgp2)
 	m.roughness = 1.0
 	m.uv1_triplanar = true
 	m.uv1_world_triplanar = true
@@ -338,23 +423,23 @@ func _slab(cx: float, cy: float, cz: float, sx: float, sy: float, sz: float,
 func _build_terrain() -> void:
 	# Poly Haven photoscanned earth (CC0), tinted to the palette of dead Veyre;
 	# graceful fallback to procedural noise if the textures are missing
-	var mat_ground: StandardMaterial3D = _pbr_mat("burned_ground_01",
+	var mat_ground: Material = _pbr_mat("burned_ground_01",
 		Color(1.0, 0.97, 0.9), 0.085)
 	if mat_ground == null:
 		mat_ground = _noisy_mat(Color(0.27, 0.25, 0.21), Color(0.5, 0.47, 0.4), 0.18)
-	var mat_rough: StandardMaterial3D = _pbr_mat("brown_mud_dry",
+	var mat_rough: Material = _pbr_mat("brown_mud_dry",
 		Color(0.78, 0.72, 0.62), 0.11)
 	if mat_rough == null:
 		mat_rough = _noisy_mat(Color(0.18, 0.165, 0.14), Color(0.36, 0.33, 0.27), 0.24)
-	var mat_ember_soil: StandardMaterial3D = _pbr_mat("brown_mud_dry",
-		Color(1.0, 0.52, 0.35), 0.14)
+	var mat_ember_soil: Material = _pbr_mat("brown_mud_dry",
+		Color(1.0, 0.52, 0.35), 0.14, 0.3)
 	if mat_ember_soil == null:
 		mat_ember_soil = _noisy_mat(Color(0.17, 0.1, 0.07), Color(0.37, 0.25, 0.17), 0.28)
-	var mat_rock: StandardMaterial3D = _pbr_mat("aerial_rocks_02",
-		Color(0.82, 0.8, 0.8), 0.1)
+	var mat_rock: Material = _pbr_mat("aerial_rocks_02",
+		Color(0.82, 0.8, 0.8), 0.1, 0.25)
 	if mat_rock == null:
 		mat_rock = _noisy_mat(Color(0.12, 0.115, 0.12), Color(0.31, 0.30, 0.31), 0.09)
-	var mat_mud: StandardMaterial3D = _pbr_mat("brown_mud", Color(0.5, 0.46, 0.42), 0.14)
+	var mat_mud: Material = _pbr_mat("brown_mud", Color(0.5, 0.46, 0.42), 0.14, 0.0)
 	if mat_mud == null:
 		mat_mud = _flat_mat(Color(0.1, 0.09, 0.075), 1.0)
 	var water_mat := ShaderMaterial.new()
@@ -375,11 +460,22 @@ func _build_terrain() -> void:
 
 	# ground-like slabs (structures stand on ordinary ground)
 	_mm_slabs(runs["."] + runs["B"], mat_ground, 1.2, -0.6)
-	_mm_slabs(runs[","], mat_rough, 1.2, -0.6)
+	# rock tiles get the rough slab too: with the old stretched box the tile was
+	# hidden underneath it, but a real rock mesh leaves gaps, and the bare base
+	# plane showed through as a pale strip running the length of every ridge
+	_mm_slabs(runs[","] + runs["#"], mat_rough, 1.2, -0.6)
 	_mm_slabs(runs["E"], mat_ember_soil, 1.2, -0.6)
 	_mm_slabs(runs["~"], mat_mud, 0.3, -1.05)                    # trench bed
 	_mm_water(runs["~"], water_mat)
+	# Ford: a RAISED bed under the SAME water surface. Dropping the ford's water
+	# plane instead put the bed above its own surface, so the crossing rendered
+	# as an opaque strip of mud — a dirt road through a river. A river has one
+	# water level; a ford is where the bottom comes up to meet it.
+	_mm_slabs(runs["f"], mat_mud, 0.3, -0.80)     # bed top -0.65 vs channel -0.90
+	_mm_water(runs["f"], water_mat)               # same surface as the channel
+	_build_ruins()                 # must precede _mm_rocks: it consumes tiles
 	_mm_rocks(runs["#"], mat_rock)
+	_mm_shore_stones(mat_rock)
 
 
 func _mm_slabs(list: Array, mat: Material, height: float, cy: float) -> void:
@@ -402,7 +498,7 @@ func _mm_slabs(list: Array, mat: Material, height: float, cy: float) -> void:
 	add_child(mmi)
 
 
-func _mm_water(list: Array, mat: Material) -> void:
+func _mm_water(list: Array, mat: Material, y := -0.5) -> void:
 	if list.is_empty():
 		return
 	var mesh := PlaneMesh.new()
@@ -414,7 +510,7 @@ func _mm_water(list: Array, mat: Material) -> void:
 	for i in range(list.size()):
 		var r: Vector3i = list[i]
 		var basis := Basis.from_scale(Vector3(r.z * T, 1.0, T))
-		var pos := Vector3((r.x + r.z * 0.5) * T, -0.5, (r.y + 0.5) * T)
+		var pos := Vector3((r.x + r.z * 0.5) * T, y, (r.y + 0.5) * T)
 		mm.set_instance_transform(i, Transform3D(basis, pos))
 	var mmi := MultiMeshInstance3D.new()
 	mmi.multimesh = mm
@@ -422,9 +518,329 @@ func _mm_water(list: Array, mat: Material) -> void:
 	add_child(mmi)
 
 
+# name, uniform scale (x tile size), how often it is picked out of 10
+# name, uniform scale (x tile size), weight out of 10, CORE-ONLY
+#
+# The last column splits the kit in two. Scaling a jagged spire up for a
+# mountain core just makes a bigger spike — which is precisely how the first
+# ranges came out looking like a stone forest. rock_e and rock_f are broad
+# geological masses built for that job and are used ONLY deep inside a rock
+# body; the fringe keeps the original boulders, which is what a mountain's
+# foothills should be made of anyway.
+const ROCK_KIT := [
+	["rock_d", 1.10, 5, false],   # low broken boulder, 320 tris — the common case
+	["rock_a", 0.80, 2, false],   # jagged spire, ~4.3 m
+	["rock_b", 1.05, 2, false],   # fractured block, ~3.0 m
+	["rock_c", 0.70, 1, false],   # tall mountain horn, ~5.2 m, used sparingly
+	["rock_e", 1.55, 6, true],    # broad layered massif, wide and low
+	["rock_f", 1.60, 4, true],    # long ridge crag with a sloping spine
+]
+
+
+# Derelict civilian structures scattered through the landscape — the thing that
+# makes a map read as a place people used to live rather than an arena.
+#
+# They are substituted for 2x2 blocks of ROCK, never dropped on open ground, and
+# that is deliberate: rock tiles are already impassable, so a ruin costs nothing
+# in pathing and cannot break the map connectivity the river and mountain carves
+# were checked against. A decorative building standing on walkable ground would
+# have units strolling through its walls.
+const RUIN_KIT := [
+	["ruin_house", 2.1],       # two-storey farmhouse shell, roof gone
+	["ruin_silo", 1.7],        # three cracked concrete grain silos
+	["ruin_shed", 2.4],        # long factory shed, half the roof collapsed
+]
+
+var _ruin_used := {}           # Vector2i -> true: rock tiles a ruin has taken
+var _ruin_ring := {}           # tiles touching a ruin: boulders kept small there
+
+
+func _build_ruins() -> void:
+	_ruin_used.clear()
+	_ruin_ring.clear()
+	var kit := []
+	for entry in RUIN_KIT:
+		var path := "res://models/%s.glb" % String(entry[0])
+		if not ResourceLoader.exists(path):
+			continue
+		var src: Node3D = (load(path) as PackedScene).instantiate()
+		var found := src.find_children("*", "MeshInstance3D", true, false)
+		if found.is_empty():
+			continue
+		kit.append({"mesh": (found[0] as MeshInstance3D).mesh,
+			"scale": float(entry[1]), "xf": []})
+	if kit.is_empty():
+		return
+
+	var depth := rock_depth()
+	for ty in range(h - 1):
+		for tx in range(w - 1):
+			var cells := [Vector2i(tx, ty), Vector2i(tx + 1, ty),
+				Vector2i(tx, ty + 1), Vector2i(tx + 1, ty + 1)]
+			var ok := true
+			for c: Vector2i in cells:
+				# all four must be rock, unclaimed, and on the FRINGE — a ruin
+				# buried in the middle of a massif would never be seen
+				# Depth 2 is the useful limit. Demanding all four tiles at depth
+				# EXACTLY 1 sounds tidier but collapses the count from 27 ruins
+				# to 3 — depth-1 tiles form a one-tile-wide ring, so a 2x2 block
+				# of them barely exists. Visibility is solved by shrinking the
+				# surrounding boulders instead (see _ruin_ring below).
+				if grid[c.y][c.x] != "#" or _ruin_used.has(c) \
+						or depth[c.y * w + c.x] > 2:
+					ok = false
+					break
+			if not ok:
+				continue
+			var hsh := tile_hash(tx, ty, 71)
+			if hsh % 100 >= 14:            # ~14% of eligible blocks
+				continue
+			var near_start := false
+			for s in starts.values():
+				if maxi(absi(tx - s.x), absi(ty - s.y)) <= 10:
+					near_start = true
+					break
+			if near_start:
+				continue
+			for c: Vector2i in cells:
+				_ruin_used[c] = true
+			# Ring: the tiles touching the footprint keep their boulder — they
+			# are impassable rock and clearing them would leave an invisible
+			# wall — but the boulder is forced back to FRINGE size so a
+			# depth-scaled neighbour cannot tower over the ruin and hide it.
+			for ry in range(ty - 1, ty + 3):
+				for rx in range(tx - 1, tx + 3):
+					var rc := Vector2i(rx, ry)
+					if rx >= 0 and ry >= 0 and rx < w and ry < h \
+							and not _ruin_used.has(rc):
+						_ruin_ring[rc] = true
+			var e: Dictionary = kit[hsh % kit.size()]
+			var s2: float = float(e["scale"]) * T * (0.88 + float((hsh >> 3) % 26) / 100.0)
+			var basis := Basis(Vector3.UP, float(hsh % 360) * PI / 180.0)
+			basis = basis.scaled(Vector3(s2, s2, s2))
+			(e["xf"] as Array).append(Transform3D(basis,
+				Vector3((tx + 1.0) * T, -0.12, (ty + 1.0) * T)))
+
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.40, 0.37, 0.34)
+	mat.roughness = 0.96
+	mat.metallic = 0.0
+	# the baked occlusion IS the detail on these: no faction paint, no trim
+	mat.vertex_color_use_as_albedo = true
+	var total := 0
+	for e in kit:
+		var xf: Array = e["xf"]
+		if xf.is_empty():
+			continue
+		var mm := MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.mesh = e["mesh"]
+		mm.instance_count = xf.size()
+		for i in range(xf.size()):
+			mm.set_instance_transform(i, xf[i])
+		var mmi := MultiMeshInstance3D.new()
+		mmi.multimesh = mm
+		mmi.material_override = mat
+		add_child(mmi)
+		total += xf.size()
+	if total > 0:
+		print("[world] %d background ruins placed" % total)
+
+
+func rock_depth() -> PackedInt32Array:
+	# How many tiles inward from open ground each rock tile sits. Multi-source
+	# BFS from every non-rock tile at once, so one pass over the map gives the
+	# whole field.
+	#
+	# This is what turns a blob of '#' into a MOUNTAIN. Every rock tile used to
+	# get the same boulder at the same size, so a rock mass read as a gravel
+	# field seen from above — flat, repetitive, and exactly the "boxy" look.
+	# Scaling by depth instead means the fringe stays low and the core rears up,
+	# which is the silhouette a massif actually has.
+	var d := PackedInt32Array()
+	d.resize(w * h)
+	var q: Array[Vector2i] = []
+	for ty in range(h):
+		for tx in range(w):
+			if grid[ty][tx] == "#":
+				d[ty * w + tx] = -1
+			else:
+				d[ty * w + tx] = 0
+				q.append(Vector2i(tx, ty))
+	var head := 0
+	while head < q.size():
+		var c: Vector2i = q[head]
+		head += 1
+		var cd: int = d[c.y * w + c.x]
+		for off: Vector2i in [Vector2i(1, 0), Vector2i(-1, 0),
+				Vector2i(0, 1), Vector2i(0, -1)]:
+			var nx: int = c.x + off.x
+			var ny: int = c.y + off.y
+			if nx < 0 or ny < 0 or nx >= w or ny >= h:
+				continue
+			if d[ny * w + nx] == -1:
+				d[ny * w + nx] = cd + 1
+				q.append(Vector2i(nx, ny))
+	return d
+
+
 func _mm_rocks(list: Array, mat: Material) -> void:
+	# Rock tiles used to be a stretched BoxMesh — literally a cube scaled to the
+	# length of the run — which is precisely why every ridge on every map read as
+	# masonry. Now each TILE gets a real rock mesh, picked, spun and tilted by
+	# its own tile hash, so a run of tiles becomes a broken ridge instead of one
+	# long block. Runs are expanded per tile for that reason: a single mesh
+	# stretched across five tiles would just be the cube problem with bumps.
 	if list.is_empty():
 		return
+	var kit := []
+	var pick := []            # fringe: the boulder kit
+	var pick_core := []       # deep inside a massif: the mountain kit
+	for entry in ROCK_KIT:
+		var path := "res://models/%s.glb" % String(entry[0])
+		if not ResourceLoader.exists(path):
+			continue
+		var src: Node3D = (load(path) as PackedScene).instantiate()
+		var found := src.find_children("*", "MeshInstance3D", true, false)
+		if found.is_empty():
+			continue
+		var slot := kit.size()
+		kit.append({"mesh": (found[0] as MeshInstance3D).mesh,
+			"scale": float(entry[1]), "xf": []})
+		var core_only: bool = entry.size() > 3 and bool(entry[3])
+		for _n in range(int(entry[2])):
+			if core_only:
+				pick_core.append(slot)
+			else:
+				pick.append(slot)
+	if pick_core.is_empty():
+		pick_core = pick          # massif models missing: fall back to boulders
+	if kit.is_empty():
+		_mm_rock_boxes(list, mat)       # models missing: keep the old look
+		return
+
+	var depth := rock_depth()
+	for r in list:
+		for step in range(r.z):
+			var tx: int = r.x + step
+			if _ruin_used.has(Vector2i(tx, r.y)):
+				continue          # a ruin stands here; no boulder through it
+			var hsh := tile_hash(tx, r.y)
+			var dcore: int = depth[r.y * w + tx]
+			if _ruin_ring.has(Vector2i(tx, r.y)):
+				dcore = 1         # next to a ruin: stay a fringe boulder
+			var plist: Array = pick_core if dcore >= 2 else pick
+			var e: Dictionary = kit[plist[hsh % plist.size()]]
+			# wide spread on purpose: at +-20% every rock in a run came out the
+			# same size and the ridge read as a string of beads
+			var s: float = float(e["scale"]) * T * (0.72 + float((hsh >> 3) % 60) / 100.0)
+			# MASSIF: how far inside the rock body this tile lies. A one-tile
+			# ridge stays a ridge (depth 1, unchanged); a thick range rears up
+			# toward its core, and the VERTICAL exaggeration is deliberately
+			# stronger than the horizontal one — widening a boulder just makes a
+			# bigger boulder, height is what reads as a mountain from a 52-degree
+			# camera. Capped at 6 so a huge massif does not grow through the sky.
+			var dep: float = clampf(float(depth[r.y * w + tx]), 1.0, 6.0) - 1.0
+			var lift := 0.0
+			var ys := s
+			if dep > 0.0:
+				# Grow the rock NEARLY UNIFORMLY and lift it. Stretching height
+				# faster than width (0.42 vs 0.30 per level) made the cores 2.7x
+				# taller than wide, and since the kit meshes are already slabby
+				# that came out as a forest of stone spikes rather than a massif.
+				# A mountain is big rock stacked high, not tall rock — so scale
+				# up evenly, keep a slight vertical bias for the peak, and let
+				# the LIFT do the work of raising the core above its foothills.
+				s *= 1.0 + 0.40 * dep
+				ys = s * (1.0 + 0.14 * dep)
+				lift = 0.34 * dep
+			var yaw := float(hsh % 360) * PI / 180.0
+			# a few degrees of lean: rocks sitting perfectly level read as props
+			var tilt := (float((hsh >> 9) % 13) - 6.0) * PI / 180.0
+			var basis := Basis(Vector3.UP, yaw) * Basis(Vector3.RIGHT, tilt)
+			basis = basis.scaled(Vector3(s, ys, s))
+			# jitter stays inside the tile so the rock never creeps onto ground
+			# a unit is allowed to walk through
+			var jx := (float((hsh >> 5) % 21) - 10.0) / 100.0 * T
+			var jz := (float((hsh >> 15) % 21) - 10.0) / 100.0 * T
+			var pos := Vector3((tx + 0.5) * T + jx, -0.15 + lift,
+				(r.y + 0.5) * T + jz)
+			(e["xf"] as Array).append(Transform3D(basis, pos))
+
+	for e in kit:
+		var xf: Array = e["xf"]
+		if xf.is_empty():
+			continue
+		var mm := MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.mesh = e["mesh"]
+		mm.instance_count = xf.size()
+		for i in range(xf.size()):
+			mm.set_instance_transform(i, xf[i])
+		var mmi := MultiMeshInstance3D.new()
+		mmi.multimesh = mm
+		mmi.material_override = mat
+		add_child(mmi)
+
+
+func _mm_shore_stones(mat: Material) -> void:
+	# Two jobs, one scatter. On a FORD the stones are signage: the crossing is
+	# only a slightly shallower band of the same water, which a player scanning
+	# for somewhere to cross will never spot — stepping stones say "here". On a
+	# BANK they break the shoreline, which is otherwise a hard rectangular cut
+	# straight along the tile grid.
+	var path := "res://models/rock_d.glb"
+	if not ResourceLoader.exists(path):
+		return
+	var src: Node3D = (load(path) as PackedScene).instantiate()
+	var found := src.find_children("*", "MeshInstance3D", true, false)
+	if found.is_empty():
+		return
+	var xf: Array[Transform3D] = []
+	for ty in range(h):
+		for tx in range(w):
+			var ch := grid[ty][tx]
+			var on_ford := ch == "f"
+			var on_bank := false
+			if ch == "," or ch == ".":
+				for d: Vector2i in [Vector2i(1, 0), Vector2i(-1, 0),
+						Vector2i(0, 1), Vector2i(0, -1)]:
+					var nx: int = tx + d.x
+					var ny: int = ty + d.y
+					if nx >= 0 and ny >= 0 and nx < w and ny < h \
+							and (grid[ny][nx] == "~" or grid[ny][nx] == "f"):
+						on_bank = true
+						break
+			if not (on_ford or on_bank):
+				continue
+			var hsh := tile_hash(tx, ty, 29)
+			# fords are marked densely, banks only sparsely dressed
+			if hsh % 100 >= (62 if on_ford else 34):
+				continue
+			var s: float = T * (0.16 + float((hsh >> 3) % 22) / 100.0)
+			var basis := Basis(Vector3.UP, float(hsh % 360) * PI / 180.0)
+			basis = basis.scaled(Vector3(s, s * 0.7, s))
+			var jx := (float((hsh >> 7) % 51) - 25.0) / 100.0 * T
+			var jz := (float((hsh >> 17) % 51) - 25.0) / 100.0 * T
+			# ford stones break the surface (-0.5); bank stones sit on the soil
+			var y := -0.62 if on_ford else -0.18
+			xf.append(Transform3D(basis, Vector3((tx + 0.5) * T + jx, y,
+				(ty + 0.5) * T + jz)))
+	if xf.is_empty():
+		return
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.mesh = (found[0] as MeshInstance3D).mesh
+	mm.instance_count = xf.size()
+	for i in range(xf.size()):
+		mm.set_instance_transform(i, xf[i])
+	var mmi := MultiMeshInstance3D.new()
+	mmi.multimesh = mm
+	mmi.material_override = mat
+	add_child(mmi)
+
+
+func _mm_rock_boxes(list: Array, mat: Material) -> void:
 	var mesh := BoxMesh.new()
 	mesh.size = Vector3.ONE
 	var mm := MultiMesh.new()
@@ -451,7 +867,9 @@ func _build_embers() -> void:
 
 	# under-glow decals: every field bleeds warm light into the ash
 	var glow_mesh := PlaneMesh.new()
-	glow_mesh.size = Vector2(2.3, 2.3)
+	# EXACTLY one tile: at 2.3 the neighbouring quads overlapped in strips, and
+	# with additive-ish alpha those strips doubled up into a glowing grid
+	glow_mesh.size = Vector2(2.0, 2.0)
 	var gmm := MultiMesh.new()
 	gmm.transform_format = MultiMesh.TRANSFORM_3D
 	gmm.mesh = glow_mesh
@@ -464,12 +882,14 @@ func _build_embers() -> void:
 	var gmi := MultiMeshInstance3D.new()
 	gmi.multimesh = gmm
 	var gmat := StandardMaterial3D.new()
-	gmat.albedo_color = Color(1.0, 0.5, 0.15, 0.22)
+	# An UNSHADED material outputs albedo and DROPS emission entirely, so the
+	# emission settings that used to be here did nothing and the under-glow
+	# never reached the bloom threshold. Values above 1.0 in the albedo of an
+	# unshaded material go straight to the HDR buffer, which is what actually
+	# makes the fields burn.
+	gmat.albedo_color = Color(1.45, 0.72, 0.22, 0.15)
 	gmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	gmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	gmat.emission_enabled = true
-	gmat.emission = Color(1.0, 0.45, 0.12)
-	gmat.emission_energy_multiplier = 0.6
 	gmi.material_override = gmat
 	gmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(gmi)
@@ -542,6 +962,61 @@ func _build_embers() -> void:
 			lamp.position = Vector3((tile.x + 0.5) * T, 1.1, (tile.y + 0.5) * T)
 			add_child(lamp)
 
+	_build_ember_motes()
+
+
+func _build_ember_motes() -> void:
+	# Sparks rising off the fields: ONE GPUParticles3D for the whole map,
+	# emitting from every ember tile at once. The signature resource should
+	# look alive, not like painted rocks.
+	if ember_tiles.is_empty():
+		return
+	var pts := Image.create(ember_tiles.size(), 1, false, Image.FORMAT_RGBF)
+	for i in range(ember_tiles.size()):
+		var t: Vector2i = ember_tiles[i]
+		pts.set_pixel(i, 0, Color((t.x + 0.5) * T, 0.25, (t.y + 0.5) * T))
+	var pm := ParticleProcessMaterial.new()
+	pm.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_POINTS
+	pm.emission_point_texture = ImageTexture.create_from_image(pts)
+	pm.emission_point_count = ember_tiles.size()
+	pm.direction = Vector3(0, 1, 0)
+	pm.spread = 12.0
+	pm.gravity = Vector3(0.15, 0.0, 0.1)      # no fall; a whisper of wind drift
+	pm.initial_velocity_min = 0.22
+	pm.initial_velocity_max = 0.65
+	pm.damping_min = 0.05
+	pm.damping_max = 0.12
+	pm.scale_min = 0.5
+	pm.scale_max = 1.0
+	var grad := Gradient.new()
+	grad.set_color(0, Color(2.2, 1.0, 0.3, 0.0))
+	grad.set_color(1, Color(0.9, 0.2, 0.05, 0.0))
+	grad.add_point(0.12, Color(2.2, 1.0, 0.3, 0.85))   # HDR: motes bloom
+	grad.add_point(0.7, Color(1.4, 0.45, 0.1, 0.4))
+	var gt := GradientTexture1D.new()
+	gt.gradient = grad
+	pm.color_ramp = gt
+	var parts := GPUParticles3D.new()
+	parts.process_material = pm
+	parts.amount = mini(60 + ember_tiles.size() * 2, 220)
+	parts.lifetime = 3.4
+	parts.preprocess = 2.0                    # fields are already alive on frame 1
+	var quad := QuadMesh.new()
+	quad.size = Vector2(0.085, 0.085)
+	var qm := StandardMaterial3D.new()
+	qm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	qm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	qm.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	qm.vertex_color_use_as_albedo = true
+	qm.billboard_mode = BaseMaterial3D.BILLBOARD_PARTICLES
+	quad.material = qm
+	parts.draw_pass_1 = quad
+	parts.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	# emitters spread across the whole map — without this AABB the node culls
+	# the moment its origin leaves the frustum and every mote vanishes
+	parts.visibility_aabb = AABB(Vector3(0, -1, 0), Vector3(w * T, 12.0, h * T))
+	add_child(parts)
+
 
 # --- scattered debris on rough ground -------------------------------------------
 
@@ -559,7 +1034,8 @@ func _build_scorch() -> void:
 			for d: Vector2i in [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1)]:
 				var nx: int = tx + d.x
 				var ny: int = ty + d.y
-				if nx >= 0 and ny >= 0 and nx < w and ny < h and grid[ny][nx] == "~":
+				if nx >= 0 and ny >= 0 and nx < w and ny < h \
+						and (grid[ny][nx] == "~" or grid[ny][nx] == "f"):
 					near_water = true
 					break
 			if not near_water:
@@ -811,7 +1287,7 @@ func hq_visual(root: Node3D, fac_id: int) -> void:
 			_:
 				_hq_karvath(root, fac)
 
-	_flag(root, fac["color"])
+	_flag(root, fac["color"], fac_id)
 
 
 func _hq_karvath(root: Node3D, _fac: Dictionary) -> void:
@@ -1186,7 +1662,7 @@ func _hq_ashfall(root: Node3D) -> void:
 		root.add_child(sb)
 
 
-func _flag(root: Node3D, col: Color) -> void:
+func _flag(root: Node3D, col: Color, fac_id := 0) -> void:
 	var pole := MeshInstance3D.new()
 	var pmesh := CylinderMesh.new()
 	pmesh.top_radius = 0.05
@@ -1199,12 +1675,21 @@ func _flag(root: Node3D, col: Color) -> void:
 
 	var quad := QuadMesh.new()
 	quad.size = Vector2(1.25, 0.55)
+	# more segments than the default 1x1: the wave is applied per VERTEX, so a
+	# two-triangle quad can only ever tilt as a rigid sheet — the cloth needs
+	# spans along its length to actually ripple
+	quad.subdivide_width = 14
+	quad.subdivide_depth = 2
 	quad.center_offset = Vector3(0.625, 0, 0)   # hangs off the pole to +X
 	var flag := MeshInstance3D.new()
 	flag.mesh = quad
 	var fmat := ShaderMaterial.new()
 	fmat.shader = load("res://flag.gdshader")
 	fmat.set_shader_parameter("col", Vector3(col.r, col.g, col.b))
+	var btex := "res://textures/flag_f%d.png" % fac_id
+	if fac_id > 0 and ResourceLoader.exists(btex):
+		fmat.set_shader_parameter("banner", load(btex))
+		fmat.set_shader_parameter("use_tex", true)
 	flag.material_override = fmat
 	flag.position = Vector3(2.6, 3.25, -2.6)
 	root.add_child(flag)
